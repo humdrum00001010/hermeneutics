@@ -2,16 +2,29 @@
 
 The root repository and `chromium/src` are separate Git repositories.
 
+## Git conventions
+
+- Start all work from an issue. Search open and closed issues first; create one
+  when none describes the work.
+- Name branches `<service>/<content>` using lowercase kebab-case. Both parts
+  must identify the owning service and the specific work. Derive the name from
+  the issue, for example `browser/cdp-host` or `panel/liveview-session`.
+- Write a concise commit subject that states the change. Prefer
+  `Add CDP host transport` over generic subjects such as `Update` or `Changes`.
+- Open a pull request for the branch and end its body with `Closes #<issue>`.
+
 ## Application and extension
 
-Create a branch, then commit and push normally:
+After creating or selecting an issue, create a branch and commit normally:
 
 ```sh
-git switch -c <branch>
+git switch -c <service>/<content>
 git add hermeneutics extension
-git commit -m "Describe the change"
-git push -u origin <branch>
+git commit -m "Add the specific capability"
+git push -u origin <service>/<content>
 ```
+
+Open or update the pull request; do not push feature work directly to `main`.
 
 Run `mix precommit` from `hermeneutics/` before pushing application changes.
 
@@ -34,7 +47,7 @@ Then publish the lightweight branch and open or update its pull request:
 
 ```sh
 git add patches/chromium.patch chromium/BASE_REVISION
-git commit -m "Update Chromium integration"
+git commit -m "Export Chromium CDP and side-panel changes"
 git push
 ```
 
