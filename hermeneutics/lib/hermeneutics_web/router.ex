@@ -17,7 +17,7 @@ defmodule HermeneuticsWeb.Router do
   scope "/", HermeneuticsWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live "/", PanelLive
   end
 
   # Other scopes may use custom stacks.

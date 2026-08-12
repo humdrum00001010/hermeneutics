@@ -1,0 +1,3048 @@
+diff --git a/chrome/browser/devtools/remote_debugging_server.cc b/chrome/browser/devtools/remote_debugging_server.cc
+index ea5ffb9a23e5167481817e7f9966ba84504e50fa..57491d4f2012cc3a3543a7063e9a46136bd99ba3 100644
+--- a/chrome/browser/devtools/remote_debugging_server.cc
++++ b/chrome/browser/devtools/remote_debugging_server.cc
+@@ -67,8 +67,7 @@ std::optional<uint16_t> ParsePort(std::string_view port_str) {
+   return std::nullopt;
+ }
+ 
+-class TCPServerSocketFactory
+-    : public content::DevToolsSocketFactory {
++class TCPServerSocketFactory : public content::DevToolsSocketFactory {
+  public:
+   explicit TCPServerSocketFactory(uint16_t port)
+       : port_(port), last_tethering_port_(kMinTetheringPort) {}
+@@ -87,11 +86,13 @@ class TCPServerSocketFactory
+   std::unique_ptr<net::ServerSocket> CreateLocalHostServerSocket(int port) {
+     std::unique_ptr<net::ServerSocket> socket(
+         new net::TCPServerSocket(nullptr, net::NetLogSource()));
+-    if (socket->ListenWithAddressAndPort(
+-            "127.0.0.1", port, kBackLog) == net::OK)
++    if (socket->ListenWithAddressAndPort("127.0.0.1", port, kBackLog) ==
++        net::OK) {
+       return socket;
+-    if (socket->ListenWithAddressAndPort("::1", port, kBackLog) == net::OK)
++    }
++    if (socket->ListenWithAddressAndPort("::1", port, kBackLog) == net::OK) {
+       return socket;
++    }
+     return nullptr;
+   }
+ 
+@@ -101,8 +102,9 @@ class TCPServerSocketFactory
+       return nullptr;
+     }
+ 
+-    if (last_tethering_port_ == kMaxTetheringPort)
++    if (last_tethering_port_ == kMaxTetheringPort) {
+       last_tethering_port_ = kMinTetheringPort;
++    }
+     uint16_t port = ++last_tethering_port_;
+     *name = base::NumberToString(port);
+     return CreateLocalHostServerSocket(port);
+@@ -332,6 +334,13 @@ void RemoteDebuggingServer::StopPipeHandler() {
+   content::DevToolsAgentHost::StopRemoteDebuggingPipeHandler();
+ }
+ 
++void RemoteDebuggingServer::StartCdpHostProcess(
++    const base::FilePath& host_path) {
++  content::DevToolsAgentHost::StartCdpHostProcess(
++      host_path,
++      base::BindOnce(&ChromeDevToolsManagerDelegate::CloseBrowserSoon));
++}
++
+ // static
+ base::expected<std::unique_ptr<RemoteDebuggingServer>,
+                RemoteDebuggingServer::NotStartedReason>
+@@ -361,6 +370,15 @@ RemoteDebuggingServer::GetInstance(PrefService* local_state) {
+     server->StartPipeHandler();
+   }
+ 
++  if (command_line.HasSwitch(switches::kCdpHostProcess)) {
++    base::FilePath host_path =
++        command_line.GetSwitchValuePath(switches::kCdpHostProcess);
++    if (!host_path.empty()) {
++      debugging_server_started = true;
++      server->StartCdpHostProcess(host_path);
++    }
++  }
++
+   std::string port_str =
+       command_line.GetSwitchValueASCII(::switches::kRemoteDebuggingPort);
+   if (auto port = ParsePort(port_str)) {
+diff --git a/chrome/browser/devtools/remote_debugging_server.h b/chrome/browser/devtools/remote_debugging_server.h
+index 650daf6766e7ea8fe483bcb5e382bb1fd251d962..5518d1e6792b5f5a1c2e8175854dd3d251fbda95 100644
+--- a/chrome/browser/devtools/remote_debugging_server.h
++++ b/chrome/browser/devtools/remote_debugging_server.h
+@@ -71,6 +71,7 @@ class RemoteDebuggingServer {
+   virtual void StopHttpServer();
+   virtual void StartPipeHandler();
+   virtual void StopPipeHandler();
++  virtual void StartCdpHostProcess(const base::FilePath& host_path);
+ 
+  private:
+   void MaybeStartOrStopServerForPrefChange();
+diff --git a/chrome/browser/extensions/api/messaging/BUILD.gn b/chrome/browser/extensions/api/messaging/BUILD.gn
+index 97e2b4077a6d5d11dc17841f077391ab974313d4..1bb3bc7219a9c317704ad2888544fa9a609e0a10 100644
+--- a/chrome/browser/extensions/api/messaging/BUILD.gn
++++ b/chrome/browser/extensions/api/messaging/BUILD.gn
+@@ -29,8 +29,11 @@ source_set("messaging") {
+ 
+     if (!is_android) {
+       sources += [
++        "cdp_host.cc",
++        "cdp_host.h",
+         "launch_context.cc",
+         "launch_context.h",
++        "native_message_built_in_host.h",
+         "native_message_process_host.cc",
+         "native_message_process_host.h",
+         "native_messaging_launch_from_native.cc",
+diff --git a/chrome/browser/extensions/api/messaging/cdp_host.cc b/chrome/browser/extensions/api/messaging/cdp_host.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b32039e02d869c1adb78142584d2b252773b372a
+--- /dev/null
++++ b/chrome/browser/extensions/api/messaging/cdp_host.cc
+@@ -0,0 +1,141 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/extensions/api/messaging/cdp_host.h"
++
++#include <utility>
++
++#include "base/containers/span.h"
++#include "base/strings/string_view_util.h"
++#include "chrome/browser/extensions/api/messaging/native_message_built_in_host.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "content/public/browser/browser_thread.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/url_pattern.h"
++#include "url/gurl.h"
++
++namespace extensions {
++
++namespace {
++
++const NativeMessageBuiltInHost kDesktopBuiltInHosts[] = {
++    {CdpHost::kHostName, CdpHost::kOrigins, &CdpHost::Create},
++};
++
++bool MatchesSecurityOrigin(const NativeMessageBuiltInHost& host,
++                           const ExtensionId& extension_id) {
++  GURL origin(std::string(kExtensionScheme) + "://" + extension_id);
++  for (const char* host_allowed_origin : host.allowed_origins) {
++    URLPattern allowed_origin(URLPattern::SCHEME_ALL, host_allowed_origin);
++    if (allowed_origin.MatchesSecurityOrigin(origin)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++std::unique_ptr<NativeMessageHost> MaybeCreateBuiltInHost(
++    const ExtensionId& source_extension_id,
++    const std::string& native_host_name,
++    content::BrowserContext* browser_context,
++    std::string* error,
++    bool* handled) {
++  *handled = false;
++  for (const auto& host : kDesktopBuiltInHosts) {
++    if (host.name == native_host_name) {
++      *handled = true;
++      if (MatchesSecurityOrigin(host, source_extension_id)) {
++        return (*host.create_function)(browser_context);
++      }
++      *error = NativeMessageHost::kForbiddenError;
++      return nullptr;
++    }
++  }
++  return nullptr;
++}
++
++// static
++std::unique_ptr<NativeMessageHost> CdpHost::Create(
++    content::BrowserContext* browser_context) {
++  return std::make_unique<CdpHost>();
++}
++
++CdpHost::CdpHost() = default;
++
++CdpHost::~CdpHost() {
++  if (browser_target_) {
++    browser_target_->DetachClient(this);
++    browser_target_.reset();
++  }
++}
++
++void CdpHost::Start(Client* client) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  client_ = client;
++  browser_target_ = content::DevToolsAgentHost::CreateForBrowser(
++      nullptr, content::DevToolsAgentHost::CreateServerSocketCallback());
++  browser_target_->AttachClient(this);
++}
++
++void CdpHost::OnMessage(const std::string& message) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  if (browser_target_) {
++    browser_target_->DispatchProtocolMessage(this, base::as_byte_span(message));
++  }
++}
++
++scoped_refptr<base::SingleThreadTaskRunner> CdpHost::task_runner() const {
++  return content::GetUIThreadTaskRunner({});
++}
++
++void CdpHost::DispatchProtocolMessage(content::DevToolsAgentHost* agent_host,
++                                      base::span<const uint8_t> message) {
++  if (client_) {
++    client_->PostMessageFromNativeHost(
++        std::string(base::as_string_view(message)));
++  }
++}
++
++void CdpHost::AgentHostClosed(content::DevToolsAgentHost* agent_host) {
++  browser_target_.reset();
++  if (client_) {
++    client_->CloseChannel(NativeMessageHost::kNativeHostExited);
++  }
++}
++
++bool CdpHost::MayAttachToURL(const GURL& url, bool is_webui) {
++  return true;
++}
++
++bool CdpHost::IsTrusted() {
++  return true;
++}
++
++bool CdpHost::MayAccessAllCookies() {
++  return true;
++}
++
++bool CdpHost::MayReadLocalFiles() {
++  return true;
++}
++
++bool CdpHost::MayWriteLocalFiles() {
++  return true;
++}
++
++bool CdpHost::AllowUnsafeOperations() {
++  return true;
++}
++
++bool CdpHost::UsesBinaryProtocol() {
++  return false;
++}
++
++std::string CdpHost::GetTypeForMetrics() {
++  return "RemoteDebugger";
++}
++
++}  // namespace extensions
+diff --git a/chrome/browser/extensions/api/messaging/cdp_host.h b/chrome/browser/extensions/api/messaging/cdp_host.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc90306f12626dd88ab6f239cf6db2c53b29279a
+--- /dev/null
++++ b/chrome/browser/extensions/api/messaging/cdp_host.h
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_EXTENSIONS_API_MESSAGING_CDP_HOST_H_
++#define CHROME_BROWSER_EXTENSIONS_API_MESSAGING_CDP_HOST_H_
++
++#include <memory>
++#include <string>
++
++#include "base/containers/span.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/task/single_thread_task_runner.h"
++#include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/devtools_agent_host_client.h"
++#include "extensions/browser/api/messaging/native_message_host.h"
++#include "extensions/common/extension_id.h"
++
++namespace content {
++class BrowserContext;
++}
++
++namespace extensions {
++
++class CdpHost : public NativeMessageHost,
++                public content::DevToolsAgentHostClient {
++ public:
++  static constexpr char kHostName[] = "org.hermeneutics.cdp";
++
++  static constexpr const char* kOrigins[] = {
++      "chrome-extension://ahjdebjciejphcmjnfmpnkaelbnhkcnb/"};
++
++  static std::unique_ptr<NativeMessageHost> Create(
++      content::BrowserContext* browser_context);
++
++  CdpHost();
++
++  CdpHost(const CdpHost&) = delete;
++  CdpHost& operator=(const CdpHost&) = delete;
++
++  ~CdpHost() override;
++
++  // NativeMessageHost:
++  void Start(Client* client) override;
++  void OnMessage(const std::string& message) override;
++  scoped_refptr<base::SingleThreadTaskRunner> task_runner() const override;
++
++  // content::DevToolsAgentHostClient:
++  void DispatchProtocolMessage(content::DevToolsAgentHost* agent_host,
++                               base::span<const uint8_t> message) override;
++  void AgentHostClosed(content::DevToolsAgentHost* agent_host) override;
++  bool MayAttachToURL(const GURL& url, bool is_webui) override;
++  bool IsTrusted() override;
++  bool MayAccessAllCookies() override;
++  bool MayReadLocalFiles() override;
++  bool MayWriteLocalFiles() override;
++  bool AllowUnsafeOperations() override;
++  bool UsesBinaryProtocol() override;
++  std::string GetTypeForMetrics() override;
++
++ private:
++  raw_ptr<Client> client_ = nullptr;
++  scoped_refptr<content::DevToolsAgentHost> browser_target_;
++};
++
++// Returns a built-in host when `native_host_name` names one. `*handled` is set
++// when the name matched, in which case a null return means the origin check
++// failed and `*error` has been populated.
++std::unique_ptr<NativeMessageHost> MaybeCreateBuiltInHost(
++    const ExtensionId& source_extension_id,
++    const std::string& native_host_name,
++    content::BrowserContext* browser_context,
++    std::string* error,
++    bool* handled);
++
++}  // namespace extensions
++
++#endif  // CHROME_BROWSER_EXTENSIONS_API_MESSAGING_CDP_HOST_H_
+diff --git a/chrome/browser/extensions/api/messaging/native_message_process_host.cc b/chrome/browser/extensions/api/messaging/native_message_process_host.cc
+index f378c3f414b15f8edeeb44e4e1bb331d3a478eac..9cfabf5d55594a0d6c1b3854eff0a2261ad22341 100644
+--- a/chrome/browser/extensions/api/messaging/native_message_process_host.cc
++++ b/chrome/browser/extensions/api/messaging/native_message_process_host.cc
+@@ -17,10 +17,12 @@
+ #include "base/logging.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/process/kill.h"
++#include "base/sys_byteorder.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/types/expected.h"
+ #include "build/build_config.h"
++#include "chrome/browser/extensions/api/messaging/cdp_host.h"
+ #include "chrome/browser/extensions/api/messaging/native_messaging_host_manifest.h"
+ #include "chrome/browser/extensions/api/messaging/native_messaging_launch_from_native.h"
+ #include "chrome/browser/extensions/api/messaging/native_process_launcher.h"
+@@ -107,6 +109,14 @@ std::unique_ptr<NativeMessageHost> NativeMessageHost::Create(
+     const std::string& native_host_name,
+     bool allow_user_level,
+     std::string* error_message) {
++  bool handled = false;
++  std::unique_ptr<NativeMessageHost> built_in =
++      MaybeCreateBuiltInHost(source_extension_id, native_host_name,
++                             browser_context, error_message, &handled);
++  if (handled) {
++    return built_in;
++  }
++
+   return NativeMessageProcessHost::CreateWithLauncher(
+       source_extension_id, native_host_name,
+       NativeProcessLauncher::CreateDefault(
+@@ -194,7 +204,8 @@ void NativeMessageProcessHost::OnMessage(const std::string& json) {
+   // Copy size and content of the message to the buffer.
+   static_assert(sizeof(uint32_t) == kMessageHeaderSize,
+                 "kMessageHeaderSize is incorrect");
+-  const uint32_t message_size = base::checked_cast<uint32_t>(json.size());
++  const uint32_t message_size =
++      base::HostToNet32(base::checked_cast<uint32_t>(json.size()));
+   UNSAFE_TODO(memcpy(buffer->data(),
+                      reinterpret_cast<const char*>(&message_size),
+                      kMessageHeaderSize));
+@@ -310,8 +321,8 @@ void NativeMessageProcessHost::ProcessIncomingData(
+     }
+ 
+     // TODO(crbug.com/428945428): Fix unsafe uses of std::string::data().
+-    size_t message_size =
+-        *UNSAFE_TODO(reinterpret_cast<const uint32_t*>(incoming_data_.data()));
++    size_t message_size = base::NetToHost32(
++        *UNSAFE_TODO(reinterpret_cast<const uint32_t*>(incoming_data_.data())));
+ 
+     if (message_size > kMaximumNativeMessageSize) {
+       LOG(ERROR) << "Native Messaging host tried sending a message that is "
+diff --git a/chrome/browser/extensions/api/side_panel/side_panel_service.cc b/chrome/browser/extensions/api/side_panel/side_panel_service.cc
+index 5474809d1dcd72927120ad2d8383ffdaec1fe568..448ef9b5e365efbd6d299ec9789991cc67f71cc7 100644
+--- a/chrome/browser/extensions/api/side_panel/side_panel_service.cc
++++ b/chrome/browser/extensions/api/side_panel/side_panel_service.cc
+@@ -344,12 +344,9 @@ void SidePanelService::DispatchOnClosedEvent(const ExtensionId& extension_id,
+ }
+ 
+ api::side_panel::PanelLayout SidePanelService::GetSidePanelLayout() {
+-  Profile* profile = Profile::FromBrowserContext(browser_context_);
++  // Alignment is fixed to the right; it is no longer user-configurable.
+   api::side_panel::PanelLayout layout;
+-  layout.side =
+-      profile->GetPrefs()->GetBoolean(prefs::kSidePanelHorizontalAlignment)
+-          ? api::side_panel::Side::kRight
+-          : api::side_panel::Side::kLeft;
++  layout.side = api::side_panel::Side::kRight;
+   return layout;
+ }
+ 
+diff --git a/chrome/browser/glic/widget/glic_side_panel_coordinator_browsertest.cc b/chrome/browser/glic/widget/glic_side_panel_coordinator_browsertest.cc
+index 4bb069571a4af26eb65fcdd59a83b5b7e18f81eb..60a5b0e4a4bb55a39f158c522ebf4a7cf12a0f73 100644
+--- a/chrome/browser/glic/widget/glic_side_panel_coordinator_browsertest.cc
++++ b/chrome/browser/glic/widget/glic_side_panel_coordinator_browsertest.cc
+@@ -26,7 +26,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+diff --git a/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc b/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc
+index 9ff65e1399ec37a84a01df38b23fd8fb0676d1df..dcef0e456694ab300ccb02251c95ef48df3ed1bc 100644
+--- a/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc
++++ b/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc
+@@ -23,7 +23,7 @@
+ #include "chrome/browser/ui/views/page_action/page_action_icon_view.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view_interface.h"
+ #include "chrome/browser/ui/views/promos/ios_promo_bubble.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
+ #include "chrome/browser/ui/views/toolbar/avatar_toolbar_button_interface.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+@@ -102,7 +102,7 @@ void ShowIOSDesktopPromoBubble(PromoType promo_type,
+           profile, PromoType::kEnhancedBrowsing, bubble_type);
+       break;
+     case PromoType::kLens: {
+-      SidePanel* side_panel = browser_view->side_panel();
++      RightSidePanel* side_panel = browser_view->side_panel();
+       IOSPromoBubble::Anchor anchor = {views::BubbleAnchor(side_panel)};
+       if (side_panel) {
+         anchor.arrow = side_panel->IsRightAligned()
+diff --git a/chrome/browser/ui/lens/lens_overlay_controller_browsertest.cc b/chrome/browser/ui/lens/lens_overlay_controller_browsertest.cc
+index 15f927e1823fb893f0b5046a6a8340de20760823..caefcb6f58d7538dde9fc190e2680b9da41d5214 100644
+--- a/chrome/browser/ui/lens/lens_overlay_controller_browsertest.cc
++++ b/chrome/browser/ui/lens/lens_overlay_controller_browsertest.cc
+@@ -92,7 +92,7 @@
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+ #include "chrome/browser/ui/views/page_action/page_action_container_view.h"
+ #include "chrome/browser/ui/views/page_action/page_action_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_header.h"
+ #include "chrome/browser/ui/webui/feedback/feedback_dialog.h"
+@@ -735,7 +735,7 @@ class LensOverlayControllerBrowserTest : public InProcessBrowserTest {
+         kActiveContentsWebViewRetrievalId);
+   }
+ 
+-  SidePanel* GetSidePanel() { return browser()->GetBrowserView().side_panel(); }
++  RightSidePanel* GetSidePanel() { return browser()->GetBrowserView().side_panel(); }
+ 
+   virtual void SetupFeatureList() {
+     feature_list_.InitWithFeaturesAndParameters(
+@@ -1371,7 +1371,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerBrowserTest, SidePanelModalDialog) {
+   // Wait for open animation to progress. This is important, otherwise when we
+   // close the lens overlay at a later time the side panel will be closed
+   // together synchronously.
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   ASSERT_TRUE(base::test::RunUntil(
+       [&]() { return side_panel->GetAnimationValue() > 0; }));
+ 
+@@ -3441,7 +3441,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerBrowserTest,
+ 
+   // Verify action recorded.
+   EXPECT_EQ(1, user_action_tester.GetActionCount(
+-                   "SidePanel.LensOverlayResults.NewTabButtonClicked"));
++                   "RightSidePanel.LensOverlayResults.NewTabButtonClicked"));
+ 
+   // Verify the loading state was never set.
+   EXPECT_EQ(test_side_panel_coordinator->side_panel_loading_set_to_true_, 0);
+@@ -3507,7 +3507,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerBrowserTest,
+ 
+   // Verify no action recorded.
+   EXPECT_EQ(0, user_action_tester.GetActionCount(
+-                   "SidePanel.LensOverlayResults.NewTabButtonClicked"));
++                   "RightSidePanel.LensOverlayResults.NewTabButtonClicked"));
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(LensOverlayControllerBrowserTest,
+@@ -4621,7 +4621,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerBrowserTest, SidePanelOpen) {
+   browser()->GetFeatures().side_panel_ui()->Show(
+       SidePanelEntry::Id::kBookmarks);
+   ASSERT_TRUE(base::test::RunUntil(
+-      [&]() { return GetSidePanel()->state() == SidePanel::State::kOpen; }));
++      [&]() { return GetSidePanel()->state() == RightSidePanel::State::kOpen; }));
+ 
+   auto* controller = GetLensOverlayController();
+   OpenLensOverlay(LensOverlayInvocationSource::kAppMenu);
+@@ -4631,7 +4631,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerBrowserTest, SidePanelOpen) {
+       [&]() { return controller->state() == State::kOverlay; }));
+ 
+   // And the side-panel should be hidden.
+-  EXPECT_EQ(GetSidePanel()->state(), SidePanel::State::kClosed);
++  EXPECT_EQ(GetSidePanel()->state(), RightSidePanel::State::kClosed);
+ }
+ 
+ // TODO(crbug.com/471036459): Reenable this test on Mac
+@@ -7808,7 +7808,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerIframeBrowserTest,
+ 
+   // Check histogram. The enum is defined in the .cc file so we can't reference
+   // it directly.
+-  histogram_tester.ExpectUniqueSample("Lens.Overlay.SidePanel.IframeLoadStatus",
++  histogram_tester.ExpectUniqueSample("Lens.Overlay.RightSidePanel.IframeLoadStatus",
+                                       /*IframeLoadStatus::kSuccess=*/0, 1);
+ }
+ 
+@@ -7846,7 +7846,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerIframeBrowserTest,
+ 
+   // Check histogram.
+   histogram_tester.ExpectUniqueSample(
+-      "Lens.Overlay.SidePanel.IframeLoadStatus",
++      "Lens.Overlay.RightSidePanel.IframeLoadStatus",
+       /*IframeLoadStatus::kFailedConnectionRefused=*/1, 1);
+ }
+ 
+@@ -7883,7 +7883,7 @@ IN_PROC_BROWSER_TEST_F(LensOverlayControllerIframeBrowserTest,
+ 
+   // Check histogram. The enum is defined in the .cc file so we can't reference
+   // it directly.
+-  histogram_tester.ExpectUniqueSample("Lens.Overlay.SidePanel.IframeLoadStatus",
++  histogram_tester.ExpectUniqueSample("Lens.Overlay.RightSidePanel.IframeLoadStatus",
+                                       /*IframeLoadStatus::kFailedOther=*/6, 1);
+ }
+ 
+diff --git a/chrome/browser/ui/read_anything/read_anything_controller_browsertest.cc b/chrome/browser/ui/read_anything/read_anything_controller_browsertest.cc
+index 6b3ef2f229b0732a13e2d1cac2b11928964058ca..79afdc51f18905a0ab1a658eeae1eb112a0b9636 100644
+--- a/chrome/browser/ui/read_anything/read_anything_controller_browsertest.cc
++++ b/chrome/browser/ui/read_anything/read_anything_controller_browsertest.cc
+@@ -33,7 +33,7 @@
+ #include "chrome/browser/ui/view_ids.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_web_ui_view.h"
+ #include "chrome/browser/ui/webui/top_chrome/webui_contents_wrapper.h"
+ #include "chrome/common/webui_url_constants.h"
+diff --git a/chrome/browser/ui/read_anything/read_anything_side_panel_controller_utils.cc b/chrome/browser/ui/read_anything/read_anything_side_panel_controller_utils.cc
+index aa52d8842dc7269018507e2489ca0013d15a90a3..ca432c85d81c29b257e499797ad05007edb6811d 100644
+--- a/chrome/browser/ui/read_anything/read_anything_side_panel_controller_utils.cc
++++ b/chrome/browser/ui/read_anything/read_anything_side_panel_controller_utils.cc
+@@ -8,7 +8,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ 
+ bool IsReadAnythingEntryShowing(BrowserWindowInterface* browser) {
+   // The side panel is not immediately hidden, and IsSidePanelEntryShowing
+@@ -19,7 +19,7 @@ bool IsReadAnythingEntryShowing(BrowserWindowInterface* browser) {
+   // false if the side panel is in the process of closing.
+   BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
+   if (browser_view &&
+-      browser_view->side_panel()->state() == SidePanel::State::kClosing) {
++      browser_view->side_panel()->state() == RightSidePanel::State::kClosing) {
+     return false;
+   }
+ 
+diff --git a/chrome/browser/ui/side_panel/side_panel_prefs.cc b/chrome/browser/ui/side_panel/side_panel_prefs.cc
+index faccbffb9564bad21868de014c166498e6855cfc..3fb3f7ffae963e3f5b726f780439f4d572242e06 100644
+--- a/chrome/browser/ui/side_panel/side_panel_prefs.cc
++++ b/chrome/browser/ui/side_panel/side_panel_prefs.cc
+@@ -6,28 +6,19 @@
+ 
+ #include "base/i18n/rtl.h"
+ #include "base/values.h"
+-#include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+-#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+ #include "chrome/common/pref_names.h"
+-#include "chrome/grit/generated_resources.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_registry_simple.h"
+-#include "components/prefs/pref_service.h"
+-#include "ui/actions/actions.h"
+-#include "ui/base/l10n/l10n_util.h"
+ 
+ namespace side_panel_prefs {
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+-// TODO(crbug.com/489780965): Move policies over as features are implemented.
+ #if !BUILDFLAG(IS_ANDROID)
+-  // When in RTL mode, the side panel should default to the left of the screen.
+-  // Otherwise, the side panel should default to the right side of the screen.
+-  // TODO(dljames): Add enum values kAlternateSide / kDefaultSide that will
+-  // replace false and true respectively.
++  // Note: RightSidePanel itself no longer reads this pref (its alignment is
++  // now fixed to the right), but other features (Lens overlay, extensions
++  // toolbar, contextual tasks button) still consult it to position
++  // themselves relative to the panel, so it remains registered for them.
+   registry->RegisterBooleanPref(prefs::kSidePanelHorizontalAlignment,
+                                 !base::i18n::IsRTL());
+   registry->RegisterBooleanPref(prefs::kGoogleSearchSidePanelEnabled, true);
+@@ -44,59 +35,4 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+ #endif
+ }
+ 
+-base::ListValue GetConfigurableSidePanelAlignments(Profile* profile) {
+-  base::ListValue panels;
+-#if !BUILDFLAG(IS_ANDROID)
+-  BrowserWindowInterface* browser =
+-      ProfileBrowserCollection::GetForProfile(profile)->FindTabbedBrowser();
+-  if (!browser) {
+-    return panels;
+-  }
+-
+-  actions::ActionItem* root_action_item =
+-      browser->GetFeatures().GetRootActionItem();
+-
+-  const base::DictValue& overrides =
+-      profile->GetPrefs()->GetDict(prefs::kSidePanelAlignmentOverrides);
+-
+-  for (auto item : overrides) {
+-    std::optional<SidePanelEntryId> id = SidePanelEntryIdFromString(item.first);
+-
+-    if (!id.has_value()) {
+-      continue;
+-    }
+-
+-    std::optional<actions::ActionId> action_id =
+-        SidePanelEntryIdToActionId(*id);
+-    if (!action_id.has_value()) {
+-      continue;
+-    }
+-    actions::ActionItem* action_item =
+-        actions::ActionManager::Get().FindAction(*action_id, root_action_item);
+-    if (!action_item || !action_item->GetVisible()) {
+-      continue;
+-    }
+-
+-    base::DictValue panel_data;
+-    panel_data.Set("id", item.first);
+-
+-    std::u16string label;
+-    // By default use the ActionItem text for the label, but features can
+-    // override that here.
+-    switch (*id) {
+-      case SidePanelEntryId::kContextualTasks:
+-        label = l10n_util::GetStringUTF16(
+-            IDS_SETTINGS_SIDE_PANEL_ALIGNMENT_CONTEXTUAL_TASKS);
+-        break;
+-      default:
+-        label = std::u16string(action_item->GetText());
+-        break;
+-    }
+-    panel_data.Set("label", label);
+-    panels.Append(std::move(panel_data));
+-  }
+-#endif
+-  return panels;
+-}
+-
+ }  // namespace side_panel_prefs
+diff --git a/chrome/browser/ui/side_panel/side_panel_prefs.h b/chrome/browser/ui/side_panel/side_panel_prefs.h
+index 5963bd365599a497f73eec70306ad66a677d1245..7ebf17b170da25f5a4e7333ba86e249866c3c0f1 100644
+--- a/chrome/browser/ui/side_panel/side_panel_prefs.h
++++ b/chrome/browser/ui/side_panel/side_panel_prefs.h
+@@ -5,11 +5,6 @@
+ #ifndef CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_PREFS_H_
+ #define CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_PREFS_H_
+ 
+-#include "base/values.h"
+-#include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+-
+-class Profile;
+-
+ namespace user_prefs {
+ class PrefRegistrySyncable;
+ }
+@@ -18,8 +13,6 @@ namespace side_panel_prefs {
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+ 
+-base::ListValue GetConfigurableSidePanelAlignments(Profile* profile);
+-
+ }  // namespace side_panel_prefs
+ 
+ #endif  // CHROME_BROWSER_UI_SIDE_PANEL_SIDE_PANEL_PREFS_H_
+diff --git a/chrome/browser/ui/startup/infobar_utils.cc b/chrome/browser/ui/startup/infobar_utils.cc
+index 8284d247b0b5ae8450066eb1e6524e9d8bd94d47..fd3d766d7628902f9a3100dd9f4241da9225e5b7 100644
+--- a/chrome/browser/ui/startup/infobar_utils.cc
++++ b/chrome/browser/ui/startup/infobar_utils.cc
+@@ -20,7 +20,6 @@
+ #include "chrome/browser/ui/startup/automation_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/bad_flags_prompt.h"
+ #include "chrome/browser/ui/startup/bidding_and_auction_consented_debugging_infobar_delegate.h"
+-#include "chrome/browser/ui/startup/google_api_keys_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/obsolete_system_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/oscryptasync_availability_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+@@ -199,19 +198,8 @@ void AddInfoBarsIfNecessary(BrowserWindowInterface* browser,
+   infobars::ContentInfoBarManager* infobar_manager =
+       infobars::ContentInfoBarManager::FromWebContents(web_contents);
+ 
+-  if (!google_apis::HasAPIKeyConfigured()) {
+-    if (infobars::IsInfoBarMigrated(
+-            infobars::InfoBarDelegate::GOOGLE_API_KEYS_INFOBAR_DELEGATE)) {
+-      if (auto* manager =
+-              infobars::BrowserInfoBarManager::From(g_browser_process)) {
+-        manager->Show(
+-            web_contents,
+-            infobars::InfoBarDelegate::GOOGLE_API_KEYS_INFOBAR_DELEGATE);
+-      }
+-    } else {
+-      GoogleApiKeysInfoBarDelegate::Create(infobar_manager);
+-    }
+-  }
++  // Intentionally not shown: this build ships without Google API keys and
++  // that's expected, so the missing-keys infobar is suppressed.
+ 
+   if (ObsoleteSystem::IsObsoleteNowOrSoon()) {
+     PrefService* local_state = g_browser_process->local_state();
+diff --git a/chrome/browser/ui/tabs/features.cc b/chrome/browser/ui/tabs/features.cc
+index bc3b0b88fdc2e09ea6efb5ad4a4cd119ac530c7c..7d0fe58d4974afaaa293d41cf52e50e89b22e678 100644
+--- a/chrome/browser/ui/tabs/features.cc
++++ b/chrome/browser/ui/tabs/features.cc
+@@ -26,7 +26,7 @@ BASE_FEATURE(kSplitViewTabRestore, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kTabSearchCjkWordBoundary, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+-BASE_FEATURE(kVerticalTabs, base::FEATURE_DISABLED_BY_DEFAULT);
++BASE_FEATURE(kVerticalTabs, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ BASE_FEATURE(kVerticalTabsLaunch,
+ #if BUILDFLAG(IS_CHROMEOS)
+diff --git a/chrome/browser/ui/tabs/tab_strip_prefs.cc b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+index 24873dd76bd280dd9e4acf1ac48966ff70aea9df..c4fd5bab320f0ce996b7fc9352ce248a7ac92a8d 100644
+--- a/chrome/browser/ui/tabs/tab_strip_prefs.cc
++++ b/chrome/browser/ui/tabs/tab_strip_prefs.cc
+@@ -29,7 +29,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+           tabs::kMigrateEverythingMenuPinnedToTabstrip));
+   registry->RegisterBooleanPref(
+       prefs::kEverythingMenuPinnedToTabstripMigrationComplete, false);
+-  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabled, false);
++  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabled, true);
+   registry->RegisterBooleanPref(
+       prefs::kVerticalTabsExpandOnHoverEnabled,
+       tabs::kVerticalTabsExpandOnHoverDefaultEnabled.Get());
+diff --git a/chrome/browser/ui/views/frame/browser_frame_view_chromeos.cc b/chrome/browser/ui/views/frame/browser_frame_view_chromeos.cc
+index 74ffd38953291f9b28996a47140a52a442665769..d199c6beaab1bc0dcc3b7e5bb82ee96426d6e2c7 100644
+--- a/chrome/browser/ui/views/frame/browser_frame_view_chromeos.cc
++++ b/chrome/browser/ui/views/frame/browser_frame_view_chromeos.cc
+@@ -36,7 +36,7 @@
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
+ #include "chrome/browser/ui/views/profiles/profile_indicator_icon.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/tab_icon_view.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index f46ffa08afcee3a910377158a65124faa91cc62b..75bf1a06f54847459735907d2cb284dccd160a33 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -200,7 +200,7 @@
+ #include "chrome/browser/ui/views/sharing/sharing_dialog_view.h"
+ #include "chrome/browser/ui/views/sharing_hub/screenshot/screenshot_captured_bubble.h"
+ #include "chrome/browser/ui/views/sharing_hub/sharing_hub_bubble_view_impl.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/status_bubble_views.h"
+ #include "chrome/browser/ui/views/tab_contents/chrome_web_contents_view_focus_helper.h"
+@@ -961,7 +961,7 @@ BrowserView::BrowserView(Browser* browser)
+       views::kElementIdentifierKey,
+       BrowserViewLayoutViews::kShadowOverlayElementId);
+ 
+-  side_panel_ = AddChildView(std::make_unique<SidePanel>(this));
++  side_panel_ = AddChildView(std::make_unique<RightSidePanel>(this));
+ 
+   // Tabstrip comes basically last because it should be before toolbar in the
+   // focus order but also needs to paint on top of everything.
+diff --git a/chrome/browser/ui/views/frame/browser_view.h b/chrome/browser/ui/views/frame/browser_view.h
+index 70e811360e59bda4a97eb353cc4310764728b3d2..4b1022b900196896d4ab16c73306e650afba4cdf 100644
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -87,7 +87,7 @@ class LocationBarView;
+ class MultiContentsView;
+ class OrganizerPanelView;
+ class ScrimView;
+-class SidePanel;
++class RightSidePanel;
+ class TabDragTarget;
+ class TabSearchBubbleHost;
+ class TabStrip;
+@@ -266,7 +266,7 @@ class BrowserView : public BrowserWindow,
+ 
+   views::View* main_shadow_overlay() { return main_shadow_overlay_; }
+ 
+-  SidePanel* side_panel() { return side_panel_; }
++  RightSidePanel* side_panel() { return side_panel_; }
+ 
+   MultiContentsView* multi_contents_view() { return multi_contents_view_; }
+ 
+@@ -1120,7 +1120,7 @@ class BrowserView : public BrowserWindow,
+   // |  |  MultiContentsView (multi_contents_view_)                        |  |
+   // |  --------------------------------------------------------------------  |
+   // |------------------------------------------------------------------------|
+-  // | SidePanel (side_panel_)                                                |
++  // | RightSidePanel (side_panel_)                                                |
+   // |------------------------------------------------------------------------|
+ 
+   // The view that draws the background the main_container and
+@@ -1235,7 +1235,7 @@ class BrowserView : public BrowserWindow,
+   // aligned to the left or the right side of the browser window depending on
+   // the kSidePanelHorizontalAlignment pref's value. Conceptually this member
+   // should exist if and only if the side_panel_coordinator is created.
+-  raw_ptr<SidePanel> side_panel_ = nullptr;
++  raw_ptr<RightSidePanel> side_panel_ = nullptr;
+ 
+   // The handler responsible for showing autofill bubbles.
+   std::unique_ptr<autofill::AutofillBubbleHandler> autofill_bubble_handler_;
+diff --git a/chrome/browser/ui/views/frame/browser_view_browsertest.cc b/chrome/browser/ui/views/frame/browser_view_browsertest.cc
+index 948227f8aff4411332ff898b5fd57243a70cde79..310f03bcd87541a523962978ba523b78ba88bfa7 100644
+--- a/chrome/browser/ui/views/frame/browser_view_browsertest.cc
++++ b/chrome/browser/ui/views/frame/browser_view_browsertest.cc
+@@ -46,7 +46,7 @@
+ #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
+ #include "chrome/browser/ui/views/frame/scrim_view.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/tabs/tab/tab_accessibility.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_layout.h b/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+index 8145f86c2a17f0017ab4715a7dbb6eab84a893d0..d66bd8966ec3a042fd44d191232c4a85085d2ee3 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout.h
+@@ -21,7 +21,7 @@ class BrowserViewLayoutDelegate;
+ class InfoBarContainerView;
+ class MultiContentsView;
+ class OrganizerPanelView;
+-class SidePanel;
++class RightSidePanel;
+ class TabStrip;
+ class TabStripRegionView;
+ class VerticalTabStripRegionView;
+@@ -76,7 +76,7 @@ struct BrowserViewLayoutViews {
+   raw_ptr<InfoBarContainerView> infobar_container = nullptr;
+   raw_ptr<views::View> contents_container = nullptr;
+   raw_ptr<MultiContentsView> multi_contents_view = nullptr;
+-  raw_ptr<SidePanel> side_panel = nullptr;
++  raw_ptr<RightSidePanel> side_panel = nullptr;
+   raw_ptr<views::View> side_panel_animation_content = nullptr;
+ 
+   // The contents separator used for when the top container is overlaid.
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+index 64cc69c116d30c7f922adf9e67232f4507780d54..b0a9fef1ff7f560447a42ec1a241c11c6330ec9c 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -33,7 +33,7 @@
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_background_blur_backdrop.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/infobars/infobar_container_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/tabs/organizer/layout_constants.h"
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_utils.h"
+ #include "chrome/browser/ui/views/tabs/organizer/organizer_panel_view.h"
+@@ -942,8 +942,9 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+           : 0.0;
+   bool side_panel_is_animating = false;
+   if (horizontal_layout.has_side_panel()) {
+-    const SidePanel* const side_panel = views().side_panel;
+-    side_panel_leading = side_panel->IsRightAligned() == base::i18n::IsRTL();
++    // The panel's alignment is fixed to the right, so it is on the leading
++    // (start) edge only in RTL layouts.
++    side_panel_leading = base::i18n::IsRTL();
+ 
+     if (side_panel_reveal_amount < 1.0) {
+       clip_content_for_animation = true;
+@@ -956,7 +957,7 @@ BrowserViewTabbedLayoutImpl::CalculateProposedLayout(
+         base::ClampFloor(target_width * side_panel_reveal_amount);
+ 
+     // Add `container_inset_padding` to the top of the side panel to separate it
+-    // from the horizontal tab strip. SidePanel draws the top on top of the top
++    // from the horizontal tab strip. RightSidePanel draws the top on top of the top
+     // content separator and some units of the toolbar by default, which is not
+     // needed for the side panel.
+     const int top = params.visual_client_area.y() +
+diff --git a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl_interactive_uitest.cc b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl_interactive_uitest.cc
+index 1265695f37bb4a8d95499f5f0a0768c2d0acba47..71b7f1f95a3f0ae5b3c2a8b45037d911da5d2e56 100644
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl_interactive_uitest.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl_interactive_uitest.cc
+@@ -34,7 +34,7 @@
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+ #include "chrome/browser/ui/views/frame/top_container_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/common/pref_names.h"
+@@ -127,7 +127,7 @@ class BrowserViewTabbedLayoutImplUiTest : public InteractiveBrowserTest {
+               return force_preferred_width.has_value();
+             },
+             Then(WithView(kSidePanelElementId,
+-                          [force_preferred_width](SidePanel* side_panel) {
++                          [force_preferred_width](RightSidePanel* side_panel) {
+                             side_panel->SetPanelWidth(*force_preferred_width);
+                             side_panel->InvalidateLayout();
+                           }),
+@@ -725,7 +725,7 @@ class BrowserViewTabbedLayoutImplContentLayoutUiTest
+         InParallel(
+             RunSubsequence(ReplaceAndShowSidePanel(SidePanelType::kToolbar)),
+             RunSubsequence(WaitForEvent(kSidePanelElementId,
+-                                        SidePanel::kOpenAnimationCompletedEvent)
++                                        RightSidePanel::kOpenAnimationCompletedEvent)
+                                .SetMustBeVisibleAtStart(false))),
+         Do([this]() { RunScheduledLayouts(); }));
+   }
+diff --git a/chrome/browser/ui/views/frame/multi_contents_view_interactive_uitest.cc b/chrome/browser/ui/views/frame/multi_contents_view_interactive_uitest.cc
+index 592544f0e91735c230b5690157ff704958f39b89..709277b7b88731f1b295da0e57fbe5430ea95f8d 100644
+--- a/chrome/browser/ui/views/frame/multi_contents_view_interactive_uitest.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_interactive_uitest.cc
+@@ -31,7 +31,7 @@
+ #include "chrome/browser/ui/views/frame/multi_contents_view_mini_toolbar.h"
+ #include "chrome/browser/ui/views/frame/scrim_view.h"
+ #include "chrome/browser/ui/views/page_info/page_info_main_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/test/split_view_interactive_test_mixin.h"
+ #include "chrome/browser/ui/views/test/tab_strip_interactive_test_mixin.h"
+ #include "chrome/common/pref_names.h"
+@@ -278,7 +278,7 @@ class MultiContentsViewUiTest
+ 
+   auto OpenContextualSidePanel() {
+     using SidePanelViewObserver =
+-        views::test::PollingViewObserver<bool, SidePanel>;
++        views::test::PollingViewObserver<bool, RightSidePanel>;
+     DEFINE_LOCAL_STATE_IDENTIFIER_VALUE(SidePanelViewObserver,
+                                         kSidePanelViewObserver);
+ 
+@@ -291,7 +291,7 @@ class MultiContentsViewUiTest
+                            .Build());
+                  })),
+                  PollView(kSidePanelViewObserver, kSidePanelElementId,
+-                          [](const SidePanel* side_panel) -> bool {
++                          [](const RightSidePanel* side_panel) -> bool {
+                             return side_panel->width() > 0 &&
+                                    side_panel->height() > 0;
+                           }),
+diff --git a/chrome/browser/ui/views/frame/shadow_overlay_view.cc b/chrome/browser/ui/views/frame/shadow_overlay_view.cc
+index 93d0cf6ecfaeb89aa7e21077f6fa057384e3a005..abdbbc5b935b079edd050908f6295c03241da45d 100644
+--- a/chrome/browser/ui/views/frame/shadow_overlay_view.cc
++++ b/chrome/browser/ui/views/frame/shadow_overlay_view.cc
+@@ -14,7 +14,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "third_party/skia/include/core/SkPath.h"
+ #include "third_party/skia/include/core/SkPathBuilder.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+@@ -276,7 +276,7 @@ double ShadowOverlayView::GetShadowValue() const {
+     return *animation_value;
+   }
+   if (const auto* panel = browser_view_->side_panel()) {
+-    return panel->state() == SidePanel::State::kOpen ? 1.0 : 0.0;
++    return panel->state() == RightSidePanel::State::kOpen ? 1.0 : 0.0;
+   }
+   return 0.0;
+ }
+diff --git a/chrome/browser/ui/views/page_info/about_this_site_side_panel_coordinator_browsertest.cc b/chrome/browser/ui/views/page_info/about_this_site_side_panel_coordinator_browsertest.cc
+index 4ac91f08672330bd0f337514f1b790613f5f5bda..70e4f28fd89a695ed80bab79da5f4f40560fd857 100644
+--- a/chrome/browser/ui/views/page_info/about_this_site_side_panel_coordinator_browsertest.cc
++++ b/chrome/browser/ui/views/page_info/about_this_site_side_panel_coordinator_browsertest.cc
+@@ -13,7 +13,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/page_info/web_view_side_panel_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+ #include "chrome/test/base/ui_test_utils.h"
+@@ -266,7 +266,7 @@ IN_PROC_BROWSER_TEST_F(AboutThisSiteSidePanelCoordinatorBrowserTest,
+   browser()->GetFeatures().side_panel_ui()->Close();
+   ASSERT_TRUE(base::test::RunUntil([&]() {
+     return browser()->GetBrowserView().side_panel()->state() ==
+-           SidePanel::State::kClosed;
++           RightSidePanel::State::kClosed;
+   }));
+   EXPECT_FALSE(IsAboutThisSiteSidePanelShowing());
+ 
+diff --git a/chrome/browser/ui/views/page_info/merchant_trust_side_panel_coordinator_browsertest.cc b/chrome/browser/ui/views/page_info/merchant_trust_side_panel_coordinator_browsertest.cc
+index d5ba419278192270f229f0e10aab523bd6490cf7..065008380cdb6b1a4dd2c323ebf8e557cf37b3e8 100644
+--- a/chrome/browser/ui/views/page_info/merchant_trust_side_panel_coordinator_browsertest.cc
++++ b/chrome/browser/ui/views/page_info/merchant_trust_side_panel_coordinator_browsertest.cc
+@@ -13,7 +13,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/page_info/web_view_side_panel_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+ #include "chrome/test/base/ui_test_utils.h"
+@@ -296,7 +296,7 @@ IN_PROC_BROWSER_TEST_F(MerchantTrustSidePanelCoordinatorBrowserTest,
+   browser()->GetFeatures().side_panel_ui()->Close();
+   ASSERT_TRUE(base::test::RunUntil([&]() {
+     return browser()->GetBrowserView().side_panel()->state() ==
+-           SidePanel::State::kClosed;
++           RightSidePanel::State::kClosed;
+   }));
+   EXPECT_FALSE(IsMerchantTrustSidePanelOpen());
+ 
+diff --git a/chrome/browser/ui/views/side_panel/BUILD.gn b/chrome/browser/ui/views/side_panel/BUILD.gn
+index a19a0cf63f636d845b3d2785a61706cf104276be..98226ee77f304c615885ab1115af0088bf0208e2 100644
+--- a/chrome/browser/ui/views/side_panel/BUILD.gn
++++ b/chrome/browser/ui/views/side_panel/BUILD.gn
+@@ -38,8 +38,8 @@ source_set("side_panel") {
+     "reading_list/read_later_side_panel_web_view.h",
+     "reading_list/reading_list_side_panel_coordinator.cc",
+     "reading_list/reading_list_side_panel_coordinator.h",
+-    "side_panel.cc",
+-    "side_panel.h",
++    "right_side_panel.cc",
++    "right_side_panel.h",
+     "side_panel_coordinator.cc",
+     "side_panel_coordinator.h",
+     "side_panel_header.cc",
+diff --git a/chrome/browser/ui/views/side_panel/extensions/extension_side_panel_browsertest.cc b/chrome/browser/ui/views/side_panel/extensions/extension_side_panel_browsertest.cc
+index 905bc74a22106dfb4fbd386e6a03b1cd8373a8bd..152420b40d9152df33f213c3bd64c4938a1a4312 100644
+--- a/chrome/browser/ui/views/side_panel/extensions/extension_side_panel_browsertest.cc
++++ b/chrome/browser/ui/views/side_panel/extensions/extension_side_panel_browsertest.cc
+@@ -41,7 +41,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/side_panel/extensions/extension_side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/extensions/extension_side_panel_manager.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/web_applications/test/web_app_browsertest_util.h"
+@@ -290,7 +290,7 @@ class ExtensionSidePanelBrowserTest : public ExtensionBrowserTest {
+   void WaitForSidePanelClose() {
+     ASSERT_TRUE(base::test::RunUntil([&]() {
+       return browser()->GetBrowserView().side_panel()->state() ==
+-             SidePanel::State::kClosed;
++             RightSidePanel::State::kClosed;
+     }));
+   }
+ 
+diff --git a/chrome/browser/ui/views/side_panel/side_panel.cc b/chrome/browser/ui/views/side_panel/right_side_panel.cc
+similarity index 87%
+rename from chrome/browser/ui/views/side_panel/side_panel.cc
+rename to chrome/browser/ui/views/side_panel/right_side_panel.cc
+index d53c2f3dfdbdad4f7eac5052cadd1edc4485c223..592ca3b71cbdb723e81676667ef7bd8d877892b7 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel.cc
++++ b/chrome/browser/ui/views/side_panel/right_side_panel.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -89,24 +89,9 @@ gfx::Insets GetBorderInsets() {
+                            border_thickness, border_thickness);
+ }
+ 
+-SidePanel::HorizontalAlignment GetHorizontalAlignment(
+-    PrefService* pref_service,
+-    std::optional<SidePanelEntryId> entry_id) {
+-  const base::DictValue& overrides =
+-      pref_service->GetDict(prefs::kSidePanelAlignmentOverrides);
+-  std::optional<bool> override_value =
+-      entry_id ? overrides.FindBool(SidePanelEntryIdToString(*entry_id))
+-               : std::nullopt;
+-
+-  bool is_right_aligned;
+-  if (override_value.has_value()) {
+-    is_right_aligned = *override_value;
+-  } else {
+-    is_right_aligned =
+-        pref_service->GetBoolean(prefs::kSidePanelHorizontalAlignment);
+-  }
+-  return is_right_aligned ? SidePanel::HorizontalAlignment::kRight
+-                          : SidePanel::HorizontalAlignment::kLeft;
++RightSidePanel::HorizontalAlignment GetHorizontalAlignment() {
++  // Alignment is fixed to the right; it is no longer user-configurable.
++  return RightSidePanel::HorizontalAlignment::kRight;
+ }
+ 
+ class ContentParentBackground : public views::Background {
+@@ -288,13 +273,12 @@ void SetClipToVisibleAreaRecursive(views::View& view,
+ 
+ }  // namespace
+ 
+-DEFINE_CLASS_CUSTOM_ELEMENT_EVENT_TYPE(SidePanel, kOpenAnimationCompletedEvent);
+-DEFINE_CLASS_CUSTOM_ELEMENT_EVENT_TYPE(SidePanel,
++DEFINE_CLASS_CUSTOM_ELEMENT_EVENT_TYPE(RightSidePanel, kOpenAnimationCompletedEvent);
++DEFINE_CLASS_CUSTOM_ELEMENT_EVENT_TYPE(RightSidePanel,
+                                        kCloseAnimationCompletedEvent);
+ 
+-SidePanel::SidePanel(BrowserView* browser_view) : browser_view_(browser_view) {
+-  horizontal_alignment_ = GetHorizontalAlignment(
+-      browser_view->GetProfile()->GetPrefs(), std::nullopt);
++RightSidePanel::RightSidePanel(BrowserView* browser_view) : browser_view_(browser_view) {
++  horizontal_alignment_ = GetHorizontalAlignment();
+ 
+   // The default z-order is the order in which children were added to the
+   // parent view. content_parent_view_ is added first so it exists behind
+@@ -307,21 +291,10 @@ SidePanel::SidePanel(BrowserView* browser_view) : browser_view_(browser_view) {
+       AddChildView(std::make_unique<views::SidePanelResizeArea>(this));
+   resize_area_->InsertBeforeInFocusList(content_parent_view_);
+ 
+-  pref_change_registrar_.Init(browser_view->GetProfile()->GetPrefs());
+-
+-  pref_change_registrar_.Add(
+-      prefs::kSidePanelHorizontalAlignment,
+-      base::BindRepeating(&SidePanel::UpdateHorizontalAlignment,
+-                          base::Unretained(this), std::nullopt));
+-  pref_change_registrar_.Add(
+-      prefs::kSidePanelAlignmentOverrides,
+-      base::BindRepeating(&SidePanel::UpdateHorizontalAlignment,
+-                          base::Unretained(this), std::nullopt));
+-
+   animation_subscription_ =
+       BrowserAnimationController::From(browser_view_->browser())
+           ->Subscribe(kAnimationGroup,
+-                      base::BindRepeating(&SidePanel::OnAnimationProgressed,
++                      base::BindRepeating(&RightSidePanel::OnAnimationProgressed,
+                                           base::Unretained(this)));
+ 
+   SetVisible(false);
+@@ -334,14 +307,14 @@ SidePanel::SidePanel(BrowserView* browser_view) : browser_view_(browser_view) {
+   SetProperty(views::kElementIdentifierKey, kSidePanelElementId);
+ }
+ 
+-SidePanel::~SidePanel() = default;
++RightSidePanel::~RightSidePanel() = default;
+ 
+-void SidePanel::SetPanelWidth(int width) {
++void RightSidePanel::SetPanelWidth(int width) {
+   // Only the width is used by BrowserViewLayout.
+   SetPreferredSize(gfx::Size(width, 1));
+ }
+ 
+-bool SidePanel::ShouldRestrictMaxWidth() const {
++bool RightSidePanel::ShouldRestrictMaxWidth() const {
+   // TODO(crbug.com/394339052): Only restricting width for only non-read
+   // anything content is a temporary solution and UX will investigate a better
+   // long term solution.
+@@ -353,14 +326,14 @@ bool SidePanel::ShouldRestrictMaxWidth() const {
+       SidePanelEntryKey(SidePanelEntryId::kReadAnything));
+ }
+ 
+-void SidePanel::SetBackgroundRadii(const gfx::RoundedCornersF& radii) {
++void RightSidePanel::SetBackgroundRadii(const gfx::RoundedCornersF& radii) {
+   if (radii == background_radii_) {
+     return;
+   }
+   background_radii_ = radii;
+ }
+ 
+-void SidePanel::UpdateWidthOnEntryChanged() {
++void RightSidePanel::UpdateWidthOnEntryChanged() {
+   SidePanelUI* side_panel_ui = SidePanelUI::From(browser_view_->browser());
+   if (!side_panel_ui) {
+     return;
+@@ -392,24 +365,24 @@ void SidePanel::UpdateWidthOnEntryChanged() {
+   }
+ }
+ 
+-bool SidePanel::IsRightAligned() const {
++bool RightSidePanel::IsRightAligned() const {
+   return horizontal_alignment() == HorizontalAlignment::kRight;
+ }
+ 
+-gfx::Size SidePanel::GetMinimumSize() const {
++gfx::Size RightSidePanel::GetMinimumSize() const {
+   const int min_height = 0;
+   return gfx::Size(
+       SidePanelEntry::kSidePanelDefaultContentWidth + GetBorderInsets().width(),
+       min_height);
+ }
+ 
+-bool SidePanel::IsClosing() {
++bool RightSidePanel::IsClosing() {
+   return SidePanelAnimations::kClose ==
+          BrowserAnimationController::From(browser_view_->browser())
+              ->GetCurrentMotion(kAnimationGroup);
+ }
+ 
+-gfx::Rect SidePanel::GetContentAnimationBounds(
++gfx::Rect RightSidePanel::GetContentAnimationBounds(
+     const gfx::Rect& side_panel_final_bounds) {
+   CHECK(content_starting_bounds_.has_value());
+   gfx::Rect content_starting_bounds = content_starting_bounds_.value();
+@@ -443,7 +416,7 @@ gfx::Rect SidePanel::GetContentAnimationBounds(
+   return animating_bounds;
+ }
+ 
+-void SidePanel::AddHeaderView(std::unique_ptr<views::View> view) {
++void RightSidePanel::AddHeaderView(std::unique_ptr<views::View> view) {
+   // If a header view already exists make sure we remove it so that it is
+   // replaced.
+   if (header_view_) {
+@@ -461,7 +434,7 @@ void SidePanel::AddHeaderView(std::unique_ptr<views::View> view) {
+                                      gfx::Insets::TLBR(top_inset, 0, 0, 0)));
+ }
+ 
+-void SidePanel::RemoveHeaderView() {
++void RightSidePanel::RemoveHeaderView() {
+   SetBorder(views::CreateEmptyBorder(GetBorderInsets().set_top(0)));
+   if (header_view_) {
+     auto header_view = RemoveChildViewT(header_view_);
+@@ -469,7 +442,7 @@ void SidePanel::RemoveHeaderView() {
+   }
+ }
+ 
+-gfx::Size SidePanel::GetContentSizeUpperBound() const {
++gfx::Size RightSidePanel::GetContentSizeUpperBound() const {
+   const int side_panel_width = width() > 0 ? width() : GetMinimumSize().width();
+   const int side_panel_height =
+       height() > 0 ? height() : browser_view_->height();
+@@ -478,18 +451,18 @@ gfx::Size SidePanel::GetContentSizeUpperBound() const {
+                    std::max(0, side_panel_height - GetBorderInsets().height()));
+ }
+ 
+-void SidePanel::OnBoundsChanged(const gfx::Rect& previous_bounds) {
++void RightSidePanel::OnBoundsChanged(const gfx::Rect& previous_bounds) {
+   if (previous_bounds.width() != width() && keyboard_resized_) {
+     keyboard_resized_ = false;
+     AnnounceResize();
+   }
+ }
+ 
+-double SidePanel::GetAnimationValue() const {
++double RightSidePanel::GetAnimationValue() const {
+   return GetAnimationValueFor(SidePanelAnimations::kPanelWidth);
+ }
+ 
+-void SidePanel::OnAnimationProgressed(
++void RightSidePanel::OnAnimationProgressed(
+     const BrowserAnimationController* controller,
+     BrowserAnimationUpdate status) {
+   switch (status) {
+@@ -543,7 +516,7 @@ void SidePanel::OnAnimationProgressed(
+   }
+ }
+ 
+-void SidePanel::UpdateSidePanelWidthPref(const std::string& panel_id,
++void RightSidePanel::UpdateSidePanelWidthPref(const std::string& panel_id,
+                                          int width) {
+   PrefService* pref_service =
+       browser_view_->browser()->GetProfile()->GetPrefs();
+@@ -554,7 +527,7 @@ void SidePanel::UpdateSidePanelWidthPref(const std::string& panel_id,
+   dict.Set(panel_id, base::Value(width));
+ }
+ 
+-void SidePanel::OnResize(int resize_amount, bool done_resizing) {
++void RightSidePanel::OnResize(int resize_amount, bool done_resizing) {
+   if (starting_width_on_resize_ < 0) {
+     starting_width_on_resize_ = width();
+   }
+@@ -587,7 +560,7 @@ void SidePanel::OnResize(int resize_amount, bool done_resizing) {
+   }
+ }
+ 
+-void SidePanel::RecordMetricsIfResized() {
++void RightSidePanel::RecordMetricsIfResized() {
+   if (did_resize_) {
+     SidePanelUI* side_panel_ui = SidePanelUI::From(browser_view_->browser());
+     if (!side_panel_ui) {
+@@ -606,25 +579,25 @@ void SidePanel::RecordMetricsIfResized() {
+   }
+ }
+ 
+-void SidePanel::SetCurrentEntryType(SidePanelType type) {
++void RightSidePanel::SetCurrentEntryType(SidePanelType type) {
+   if (current_entry_type_ != type) {
+     current_entry_type_ = type;
+   }
+ }
+ 
+-SidePanelType SidePanel::GetCurrentEntryType() const {
++SidePanelType RightSidePanel::GetCurrentEntryType() const {
+   return current_entry_type_;
+ }
+ 
+-void SidePanel::Open(bool animated) {
++void RightSidePanel::Open(bool animated) {
+   UpdateVisibility(/*should_be_open=*/true, animated);
+ }
+ 
+-void SidePanel::Close(bool animated) {
++void RightSidePanel::Close(bool animated) {
+   UpdateVisibility(/*should_be_open=*/false, animated);
+ }
+ 
+-void SidePanel::ResetSidePanelAnimationContent() {
++void RightSidePanel::ResetSidePanelAnimationContent() {
+   if (browser_view_->GetSidePanelAnimationContent()) {
+     CHECK(content_parent_view_->children().size() == 0);
+     content_starting_bounds_.reset();
+@@ -637,11 +610,11 @@ void SidePanel::ResetSidePanelAnimationContent() {
+   }
+ }
+ 
+-views::View* SidePanel::GetContentParentView() {
++views::View* RightSidePanel::GetContentParentView() {
+   return content_parent_view_;
+ }
+ 
+-void SidePanel::SetClipToVisibleArea(
++void RightSidePanel::SetClipToVisibleArea(
+     const std::optional<gfx::Rect>& clip_to_visible_area) {
+   // Clip this view, through its grandchildren; this should catch any
+   // `NativeViewHost` parented to a `WebView`. (This is an optimization; all
+@@ -649,7 +622,7 @@ void SidePanel::SetClipToVisibleArea(
+   SetClipToVisibleAreaRecursive(*this, clip_to_visible_area, 2);
+ }
+ 
+-void SidePanel::UpdateVisibility(bool should_be_open, bool animate_transition) {
++void RightSidePanel::UpdateVisibility(bool should_be_open, bool animate_transition) {
+   animate_transition &= ShouldShowAnimation();
+   if (should_be_open) {
+     state_ = animate_transition && state_ != State::kOpen ? State::kOpening
+@@ -706,19 +679,19 @@ void SidePanel::UpdateVisibility(bool should_be_open, bool animate_transition) {
+   }
+ }
+ 
+-double SidePanel::GetAnimationValueFor(BrowserAnimationSequence which) const {
++double RightSidePanel::GetAnimationValueFor(BrowserAnimationSequence which) const {
+   return BrowserAnimationController::From(browser_view_->browser())
+       ->GetCurrentValue(kAnimationGroup, which)
+       .value_or(state_ == State::kOpen ? 1.0 : 0.0);
+ }
+ 
+-bool SidePanel::ShouldShowAnimation() const {
++bool RightSidePanel::ShouldShowAnimation() const {
+   bool should_show_animations =
+       gfx::Animation::ShouldRenderRichAnimation() && !animations_disabled_;
+   return should_show_animations;
+ }
+ 
+-void SidePanel::AnnounceResize() {
++void RightSidePanel::AnnounceResize() {
+   float side_panel_width = width();
+   float web_contents_width =
+       browser_view_->contents_container()->bounds().width();
+@@ -744,20 +717,5 @@ void SidePanel::AnnounceResize() {
+       base::FormatPercent(side_panel_percentage)));
+ }
+ 
+-void SidePanel::UpdateHorizontalAlignment(
+-    std::optional<SidePanelEntryId> entry_id) {
+-  if (!entry_id) {
+-    if (auto* side_panel_ui =
+-            browser_view_->browser()->GetFeatures().side_panel_ui()) {
+-      entry_id = side_panel_ui->GetCurrentEntryId();
+-    }
+-  }
+-
+-  horizontal_alignment_ =
+-      GetHorizontalAlignment(browser_view_->GetProfile()->GetPrefs(), entry_id);
+-
+-  InvalidateLayout();
+-}
+-
+-BEGIN_METADATA(SidePanel)
++BEGIN_METADATA(RightSidePanel)
+ END_METADATA
+diff --git a/chrome/browser/ui/views/side_panel/side_panel.h b/chrome/browser/ui/views/side_panel/right_side_panel.h
+similarity index 90%
+rename from chrome/browser/ui/views/side_panel/side_panel.h
+rename to chrome/browser/ui/views/side_panel/right_side_panel.h
+index 3db88e2d54ca1c8bed014ca5848afaf296a7e061..32f440f66568e017534cf5fa40f9b46989501e2c 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel.h
++++ b/chrome/browser/ui/views/side_panel/right_side_panel.h
+@@ -2,8 +2,8 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#ifndef CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_SIDE_PANEL_H_
+-#define CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_SIDE_PANEL_H_
++#ifndef CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_RIGHT_SIDE_PANEL_H_
++#define CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_RIGHT_SIDE_PANEL_H_
+ 
+ #include <memory>
+ #include <optional>
+@@ -13,7 +13,6 @@
+ #include "chrome/browser/ui/animation/browser_animation_types.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry.h"
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
+-#include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/interaction/element_tracker.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/animation/slide_animation.h"
+@@ -25,9 +24,9 @@
+ 
+ class BrowserView;
+ 
+-class SidePanel : public views::AccessiblePaneView,
++class RightSidePanel : public views::AccessiblePaneView,
+                   public views::ResizeAreaDelegate {
+-  METADATA_HEADER(SidePanel, views::AccessiblePaneView)
++  METADATA_HEADER(RightSidePanel, views::AccessiblePaneView)
+ 
+  public:
+   // Determines the side from which the side panel will appear.
+@@ -35,10 +34,10 @@ class SidePanel : public views::AccessiblePaneView,
+   // BrowserViewLayout::LayoutSidePanelView. As such, left will always be on the
+   // left side of the browser regardless of LTR / RTL mode.
+   enum class HorizontalAlignment { kLeft = 0, kRight };
+-  explicit SidePanel(BrowserView* browser_view);
+-  SidePanel(const SidePanel&) = delete;
+-  SidePanel& operator=(const SidePanel&) = delete;
+-  ~SidePanel() override;
++  explicit RightSidePanel(BrowserView* browser_view);
++  RightSidePanel(const RightSidePanel&) = delete;
++  RightSidePanel& operator=(const RightSidePanel&) = delete;
++  ~RightSidePanel() override;
+ 
+   DECLARE_CLASS_CUSTOM_ELEMENT_EVENT_TYPE(kOpenAnimationCompletedEvent);
+   DECLARE_CLASS_CUSTOM_ELEMENT_EVENT_TYPE(kCloseAnimationCompletedEvent);
+@@ -47,8 +46,6 @@ class SidePanel : public views::AccessiblePaneView,
+   bool ShouldRestrictMaxWidth() const;
+   void UpdateWidthOnEntryChanged();
+   void UpdateSidePanelWidthPref(const std::string& panel_id, int width);
+-  void UpdateHorizontalAlignment(
+-      std::optional<SidePanelEntryId> entry_id = std::nullopt);
+   double GetAnimationValue() const;
+   gfx::RoundedCornersF background_radii() const { return background_radii_; }
+   void SetBackgroundRadii(const gfx::RoundedCornersF& radii);
+@@ -172,9 +169,6 @@ class SidePanel : public views::AccessiblePaneView,
+   // Keeps track of the side the side panel will appear on (left or right).
+   HorizontalAlignment horizontal_alignment_;
+ 
+-  // Observes and listens to side panel alignment changes.
+-  PrefChangeRegistrar pref_change_registrar_;
+-
+   State state_ = State::kClosed;
+ 
+   // Subscription for animation updates.
+@@ -184,4 +178,4 @@ class SidePanel : public views::AccessiblePaneView,
+   std::map<BrowserAnimationSequence, double> last_animation_values_;
+ };
+ 
+-#endif  // CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_SIDE_PANEL_H_
++#endif  // CHROME_BROWSER_UI_VIEWS_SIDE_PANEL_RIGHT_SIDE_PANEL_H_
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc b/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
+index 23d3c51c786881c3a0bdf158fc14f13c215c65f5..6654d4f18c494fef465522a85c8aea714c3b081e 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator.cc
+@@ -28,7 +28,7 @@
+ #include "chrome/browser/ui/toolbar/toolbar_actions_model.h"
+ #include "chrome/browser/ui/user_education/browser_user_education_interface.h"
+ #include "chrome/browser/ui/views/interaction/browser_elements_views.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_header.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_header_controller.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_helper.h"
+@@ -51,7 +51,7 @@ SidePanelCoordinator::SidePanelCoordinator(BrowserWindowInterface* browser)
+       scoped_unowned_user_data_(browser->GetUnownedUserDataHost(), *this) {
+   // SidePanelCoordinator should only be created for the Views implementation of
+   // the BrowserWindow.
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   CHECK(side_panel);
+ 
+   // TODO(pbos): Investigate whether the side panels should be creatable when
+@@ -80,7 +80,7 @@ void SidePanelCoordinator::Toggle(SidePanelEntryKey key,
+                                   SidePanelOpenTrigger open_trigger) {
+   // If an entry is already showing in the sidepanel, the sidepanel
+   // should be closed.
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   SidePanelEntry* const entry = GetEntryForKey(key);
+   if (entry && IsSidePanelEntryShowing(key) && !side_panel->IsClosing()) {
+     Close();
+@@ -105,7 +105,7 @@ void SidePanelCoordinator::Toggle(SidePanelEntryKey key,
+ void SidePanelCoordinator::ShowFrom(
+     SidePanelEntryKey entry_key,
+     gfx::Rect starting_bounds_in_browser_coordinates) {
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   side_panel->set_animation_starting_bounds_for_content(
+       starting_bounds_in_browser_coordinates);
+   SidePanelUI::Show(entry_key);
+@@ -170,10 +170,10 @@ void SidePanelCoordinator::Show(
+   if (IsSidePanelShowing() && *current_key() == input) {
+     waiter()->ResetLoadingEntryIfNecessary();
+ 
+-    SidePanel* side_panel = GetSidePanel();
++    RightSidePanel* side_panel = GetSidePanel();
+     CHECK(side_panel);
+     // If the side panel is in the process of closing, show it instead.
+-    if (side_panel->state() == SidePanel::State::kClosing) {
++    if (side_panel->state() == RightSidePanel::State::kClosing) {
+       side_panel->Open(/*animated=*/!suppress_animations);
+       side_panel_toolbar_pinning_controller_->UpdateActiveState(
+           entry->key(),
+@@ -214,7 +214,7 @@ void SidePanelCoordinator::Show(
+ //   mechanism, this method is not called.
+ void SidePanelCoordinator::Close(SidePanelEntryHideReason reason,
+                                  bool suppress_animations) {
+-  SidePanel* const side_panel = GetSidePanel();
++  RightSidePanel* const side_panel = GetSidePanel();
+   if (!IsSidePanelShowing() ||
+       (!suppress_animations && side_panel->IsClosing())) {
+     return;
+@@ -265,15 +265,13 @@ void SidePanelCoordinator::PopulateSidePanel(
+     std::optional<SidePanelOpenTrigger> open_trigger,
+     SidePanelEntry* entry,
+     std::optional<SidePanelNativeView> content_view) {
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   CHECK(side_panel);
+ 
+   side_panel->SetCurrentEntryType(entry->type());
+ 
+   entry->set_last_open_trigger(open_trigger);
+ 
+-  side_panel->UpdateHorizontalAlignment(entry->key().id());
+-
+   if (entry->should_show_header()) {
+     side_panel->AddHeaderView(std::make_unique<SidePanelHeader>(
+         std::make_unique<SidePanelHeaderController>(
+@@ -366,7 +364,7 @@ void SidePanelCoordinator::ClearCachedEntryViews() {
+ void SidePanelCoordinator::MaybeShowEntryOnTabStripModelChanged(
+     SidePanelRegistry* old_contextual_registry,
+     SidePanelRegistry* new_contextual_registry) {
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   CHECK(side_panel);
+   // Show an entry in the following fallback order: new contextual registry's
+   // active entry > active global entry > none (close the side panel).
+@@ -413,13 +411,13 @@ void SidePanelCoordinator::SetNoDelaysForTesting(bool no_delays_for_testing) {
+ void SidePanelCoordinator::OnViewVisibilityChanged(views::View* observed_view,
+                                                    views::View* starting_from,
+                                                    bool visible) {
+-  SidePanel* side_panel = views::AsViewClass<SidePanel>(observed_view);
++  RightSidePanel* side_panel = views::AsViewClass<RightSidePanel>(observed_view);
+   CHECK(side_panel);
+ 
+   // This method is called in 3 situations:
+-  //   (1) The SidePanel was previously invisible, and Show() is called. This is
++  //   (1) The RightSidePanel was previously invisible, and Show() is called. This is
+   //   independent of the /*suppress_animations*/ parameter, and is re-entrant.
+-  //   (2) The SidePanel was previously visible and has finished becoming
++  //   (2) The RightSidePanel was previously visible and has finished becoming
+   //   invisible. This is asynchronous if animated, and re-entrant if
+   //   non-animated.
+   //   (3) A parent view or widget changes its visibility state (e.g. window
+@@ -477,7 +475,7 @@ void SidePanelCoordinator::ClosePromoAndMaybeNotifyUsed(
+   }
+ }
+ 
+-SidePanel* SidePanelCoordinator::GetSidePanel() {
+-  return views::AsViewClass<SidePanel>(
++RightSidePanel* SidePanelCoordinator::GetSidePanel() {
++  return views::AsViewClass<RightSidePanel>(
+       BrowserElementsViews::From(&*browser_)->GetView(kSidePanelElementId));
+ }
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_coordinator.h b/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
+index 73bad76d1e3f736cdcdc741afb304b9871a8fb77..acb2766fe359b5a4606d0d667aeb21678be51a32 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
++++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator.h
+@@ -21,7 +21,7 @@
+ #include "ui/views/view_observer.h"
+ 
+ class BrowserWindowInterface;
+-class SidePanel;
++class RightSidePanel;
+ 
+ namespace views {
+ class View;
+@@ -106,7 +106,7 @@ class SidePanelCoordinator final : public SidePanelUIBase,
+                                     SidePanelEntryId promo_id,
+                                     SidePanelEntryId actual_id);
+ 
+-  SidePanel* GetSidePanel();
++  RightSidePanel* GetSidePanel();
+ 
+   const raw_ref<BrowserWindowInterface> browser_;
+ 
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_coordinator_browsertest.cc b/chrome/browser/ui/views/side_panel/side_panel_coordinator_browsertest.cc
+index dcd8246ef9d701cdb03c13165256adef33be3939..4783cd978110e3c14a63c3091a18c33fb469e60c 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_coordinator_browsertest.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel_coordinator_browsertest.cc
+@@ -55,7 +55,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/layout/browser_view_layout.h"
+ #include "chrome/browser/ui/views/frame/multi_contents_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_header.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+@@ -185,7 +185,7 @@ class SidePanelCoordinatorTest : public InProcessBrowserTest {
+     EXPECT_EQ(entry.value(), id);
+   }
+ 
+-  SidePanel* GetSidePanel(Browser* browser = nullptr) {
++  RightSidePanel* GetSidePanel(Browser* browser = nullptr) {
+     if (!browser) {
+       browser = this->browser();
+     }
+@@ -317,7 +317,7 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, VerifyFocusOrder) {
+   Init();
+   coordinator()->DisableAnimationsForTesting();
+   coordinator()->Show(SidePanelEntry::Key(SidePanelEntry::Id::kBookmarks));
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   auto children_in_focus_order = side_panel->GetChildrenFocusList();
+   auto resize_it =
+       std::find(children_in_focus_order.begin(), children_in_focus_order.end(),
+@@ -375,18 +375,18 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, OpenWhileClosing) {
+   coordinator()->Show(SidePanelEntry::Key(SidePanelEntry::Id::kBookmarks));
+   EXPECT_TRUE(observer.WaitForShown());
+   ASSERT_TRUE(base::test::RunUntil(
+-      [&]() { return GetSidePanel()->state() == SidePanel::State::kOpen; }));
++      [&]() { return GetSidePanel()->state() == RightSidePanel::State::kOpen; }));
+ 
+   // Closing the side panel is asynchronous.
+   coordinator()->Close();
+-  EXPECT_EQ(GetSidePanel()->state(), SidePanel::State::kClosing);
++  EXPECT_EQ(GetSidePanel()->state(), RightSidePanel::State::kClosing);
+ 
+   // Opening the same entry should cancel the close.
+   coordinator()->Show(SidePanelEntry::Key(SidePanelEntry::Id::kBookmarks));
+   EXPECT_TRUE(observer.WaitForHideCancelled());
+   auto state = GetSidePanel()->state();
+-  EXPECT_TRUE(state == SidePanel::State::kOpen ||
+-              state == SidePanel::State::kOpening);
++  EXPECT_TRUE(state == RightSidePanel::State::kOpen ||
++              state == RightSidePanel::State::kOpening);
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, OpenAndCloseWithoutAnimation) {
+@@ -395,10 +395,10 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, OpenAndCloseWithoutAnimation) {
+   // Since there is no animation opening/closing the side-panel should be
+   // synchronous.
+   coordinator()->Show(SidePanelEntry::Key(SidePanelEntry::Id::kBookmarks));
+-  EXPECT_EQ(GetSidePanel()->state(), SidePanel::State::kOpen);
++  EXPECT_EQ(GetSidePanel()->state(), RightSidePanel::State::kOpen);
+ 
+   coordinator()->Close();
+-  EXPECT_EQ(GetSidePanel()->state(), SidePanel::State::kClosed);
++  EXPECT_EQ(GetSidePanel()->state(), RightSidePanel::State::kClosed);
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, ChangeSidePanelWidth) {
+@@ -670,13 +670,13 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, ChangeSidePanelAlignment) {
+       prefs::kSidePanelHorizontalAlignment, true);
+   EXPECT_TRUE(GetSidePanel()->IsRightAligned());
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kRight);
++            RightSidePanel::HorizontalAlignment::kRight);
+ 
+   browser()->GetBrowserView().GetProfile()->GetPrefs()->SetBoolean(
+       prefs::kSidePanelHorizontalAlignment, false);
+   EXPECT_FALSE(GetSidePanel()->IsRightAligned());
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, SidePanelAlignmentOverrides) {
+@@ -687,17 +687,17 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, SidePanelAlignmentOverrides) {
+   prefs->SetBoolean(prefs::kSidePanelHorizontalAlignment, true);
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kReadingList);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kRight);
++            RightSidePanel::HorizontalAlignment::kRight);
+ 
+   // Verify overridden panels use their overrides despite the default pref.
+   // Glic is kRight and ContextualTasks is kLeft.
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kGlic);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kRight);
++            RightSidePanel::HorizontalAlignment::kRight);
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kContextualTasks);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ 
+   // Toggle the default pref and verify glic and contextual tasks alignment is
+   // unchanged.
+@@ -705,15 +705,15 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, SidePanelAlignmentOverrides) {
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kReadingList);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kGlic);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kRight);
++            RightSidePanel::HorizontalAlignment::kRight);
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kContextualTasks);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ 
+   // Verify changes to glic/contextual tasks only apply to that feature.
+   base::DictValue new_overrides;
+@@ -725,15 +725,15 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, SidePanelAlignmentOverrides) {
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kReadingList);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kGlic);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ 
+   GetSidePanel()->UpdateHorizontalAlignment(SidePanelEntryId::kContextualTasks);
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kRight);
++            RightSidePanel::HorizontalAlignment::kRight);
+ }
+ 
+ // Verify that right and left alignment works the same as when in LTR mode.
+@@ -746,13 +746,13 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, ChangeSidePanelAlignmentRTL) {
+       prefs::kSidePanelHorizontalAlignment, true);
+   EXPECT_TRUE(GetSidePanel()->IsRightAligned());
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kRight);
++            RightSidePanel::HorizontalAlignment::kRight);
+ 
+   browser()->GetBrowserView().GetProfile()->GetPrefs()->SetBoolean(
+       prefs::kSidePanelHorizontalAlignment, false);
+   EXPECT_FALSE(GetSidePanel()->IsRightAligned());
+   EXPECT_EQ(GetSidePanel()->horizontal_alignment(),
+-            SidePanel::HorizontalAlignment::kLeft);
++            RightSidePanel::HorizontalAlignment::kLeft);
+ }
+ 
+ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest,
+@@ -1387,7 +1387,7 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest,
+ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest, SidePanelWidthPreference) {
+   Init();
+   ASSERT_TRUE(&browser()->GetBrowserView());
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   ASSERT_TRUE(side_panel);
+ 
+   PrefService* prefs =
+@@ -1452,7 +1452,7 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest,
+   Init();
+   coordinator()->DisableAnimationsForTesting();
+   BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser());
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   ASSERT_TRUE(side_panel);
+ 
+   SidePanelEntry* const bookmarks_entry = global_registry()->GetEntryForKey(
+@@ -1483,7 +1483,7 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest,
+   coordinator()->DisableAnimationsForTesting();
+ 
+   BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser());
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   ASSERT_TRUE(side_panel);
+ 
+   SidePanelEntry* const bookmarks_entry = global_registry()->GetEntryForKey(
+@@ -1513,7 +1513,7 @@ IN_PROC_BROWSER_TEST_F(SidePanelCoordinatorTest,
+                        SidePanelUsesMinimumWidthIfNoPrefOrDefault) {
+   Init();
+   BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser());
+-  SidePanel* side_panel = GetSidePanel();
++  RightSidePanel* side_panel = GetSidePanel();
+   ASSERT_TRUE(side_panel);
+   coordinator()->DisableAnimationsForTesting();
+ 
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_interactive_uitest.cc b/chrome/browser/ui/views/side_panel/side_panel_interactive_uitest.cc
+index 316790efb5effe68ab65de1dd6afd8299f723d2c..d22930e99248d762a7ccc059aa440c4695e66450 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_interactive_uitest.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel_interactive_uitest.cc
+@@ -30,7 +30,7 @@
+ #include "chrome/browser/ui/toolbar/pinned_toolbar/pinned_toolbar_actions_model.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_resize_area.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_action_toolbar_button.h"
+@@ -714,7 +714,7 @@ IN_PROC_BROWSER_TEST_F(PinnedSidePanelInteractiveTest, CloseRestoresFocus) {
+             views::FocusManager* focus_manager =
+                 BrowserView::GetBrowserViewForBrowser(browser())
+                     ->GetFocusManager();
+-            SidePanel* side_panel =
++            RightSidePanel* side_panel =
+                 BrowserView::GetBrowserViewForBrowser(browser())->side_panel();
+             views::View* focused_view = focus_manager->GetStoredFocusView();
+             return focused_view && !side_panel->Contains(focused_view);
+@@ -739,7 +739,7 @@ class SidePanelAnimationPerfUiTest : public SidePanelInteractiveTest {
+         SelectMenuItem(AppMenuModel::kBookmarksMenuItem),
+         SelectMenuItem(BookmarkSubMenuModel::kShowBookmarkSidePanelItem),
+         WaitForEvent(kSidePanelElementId,
+-                     SidePanel::kOpenAnimationCompletedEvent)
++                     RightSidePanel::kOpenAnimationCompletedEvent)
+             .SetMustBeVisibleAtStart(false));
+   }
+ 
+@@ -749,14 +749,14 @@ class SidePanelAnimationPerfUiTest : public SidePanelInteractiveTest {
+         RunSubsequence(RegisterAndShowBasicSidePanel(kTestSidePanelId,
+                                                      SidePanelType::kToolbar)),
+         RunSubsequence(WaitForEvent(kSidePanelElementId,
+-                                    SidePanel::kOpenAnimationCompletedEvent)
++                                    RightSidePanel::kOpenAnimationCompletedEvent)
+                            .SetMustBeVisibleAtStart(false)));
+   }
+ 
+   auto CloseSidePanel() {
+     return Steps(PressButton(kSidePanelCloseButtonElementId),
+                  WaitForEvent(kSidePanelElementId,
+-                              SidePanel::kCloseAnimationCompletedEvent),
++                              RightSidePanel::kCloseAnimationCompletedEvent),
+                  WaitForHide(kSidePanelElementId));
+   }
+ 
+@@ -769,21 +769,21 @@ IN_PROC_BROWSER_TEST_F(SidePanelAnimationPerfUiTest, OpenSidePanel) {
+   RunTestSequence(StartCollectingSamples(), OpenBookmarksSidePanel(),
+                   Do([this, &has_fps]() {
+                     histogram_tester_->ExpectTotalCount(
+-                        "SidePanel.Open.TimeOfLongestAnimationStep", 1);
++                        "RightSidePanel.Open.TimeOfLongestAnimationStep", 1);
+                     has_fps = histogram_tester_->GetTotalCountForPrefix(
+-                                  "SidePanel.Open.AnimationFPS") > 0;
++                                  "RightSidePanel.Open.AnimationFPS") > 0;
+                   }),
+                   CheckResult(
+                       [this]() {
+                         return histogram_tester_->GetTotalSum(
+-                            "SidePanel.Open.TimeOfLongestAnimationStep");
++                            "RightSidePanel.Open.TimeOfLongestAnimationStep");
+                       },
+                       testing::Gt(0), "Check longest step is nonzero."),
+                   If([&] { return has_fps; },
+                      Then(CheckResult(
+                          [this]() {
+                            return histogram_tester_->GetTotalSum(
+-                               "SidePanel.Open.AnimationFPS");
++                               "RightSidePanel.Open.AnimationFPS");
+                          },
+                          testing::Gt(0), "Check fps is nonzero.")),
+                      Else(Log("Compositor failed to render during test."))));
+@@ -794,21 +794,21 @@ IN_PROC_BROWSER_TEST_F(SidePanelAnimationPerfUiTest, CloseSidePanel) {
+   RunTestSequence(OpenBookmarksSidePanel(), StartCollectingSamples(),
+                   CloseSidePanel(), Do([this, &has_fps]() {
+                     histogram_tester_->ExpectTotalCount(
+-                        "SidePanel.Close.TimeOfLongestAnimationStep", 1);
++                        "RightSidePanel.Close.TimeOfLongestAnimationStep", 1);
+                     has_fps = histogram_tester_->GetTotalCountForPrefix(
+-                                  "SidePanel.Close.AnimationFPS") > 0;
++                                  "RightSidePanel.Close.AnimationFPS") > 0;
+                   }),
+                   CheckResult(
+                       [this]() {
+                         return histogram_tester_->GetTotalSum(
+-                            "SidePanel.Close.TimeOfLongestAnimationStep");
++                            "RightSidePanel.Close.TimeOfLongestAnimationStep");
+                       },
+                       testing::Gt(0), "Check longest step is nonzero."),
+                   If([&] { return has_fps; },
+                      Then(CheckResult(
+                          [this]() {
+                            return histogram_tester_->GetTotalSum(
+-                               "SidePanel.Close.AnimationFPS");
++                               "RightSidePanel.Close.AnimationFPS");
+                          },
+                          testing::Gt(0), "Check fps is nonzero.")),
+                      Else(Log("Compositor failed to render during test."))));
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_resize_area.cc b/chrome/browser/ui/views/side_panel/side_panel_resize_area.cc
+index b7663b7b03f9b2e7921117228fbf6162fb3a6bc4..0dd63cdcda407fcfc96c44d6a93f11a9e1fef18f 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_resize_area.cc
++++ b/chrome/browser/ui/views/side_panel/side_panel_resize_area.cc
+@@ -25,7 +25,7 @@
+ 
+ namespace views {
+ 
+-SidePanelResizeHandle::SidePanelResizeHandle(SidePanel* side_panel)
++SidePanelResizeHandle::SidePanelResizeHandle(RightSidePanel* side_panel)
+     : side_panel_(side_panel) {
+   SetProperty(views::kElementIdentifierKey, kSidePanelResizeHandleElementId);
+   SetVisible(false);
+@@ -49,7 +49,7 @@ void SidePanelResizeHandle::OnThemeChanged() {
+ BEGIN_METADATA(SidePanelResizeHandle)
+ END_METADATA
+ 
+-SidePanelResizeArea::SidePanelResizeArea(SidePanel* side_panel)
++SidePanelResizeArea::SidePanelResizeArea(RightSidePanel* side_panel)
+     : ResizeArea(side_panel), side_panel_(side_panel) {
+   SetProperty(views::kElementIdentifierKey, kSidePanelResizeAreaElementId);
+   SetPaintToLayer();
+diff --git a/chrome/browser/ui/views/side_panel/side_panel_resize_area.h b/chrome/browser/ui/views/side_panel/side_panel_resize_area.h
+index ec91c5e2c44d55043cae8c3a497d5f0acf8917b0..e7733c5a1be00e0cf4b5334ef1df171475670170 100644
+--- a/chrome/browser/ui/views/side_panel/side_panel_resize_area.h
++++ b/chrome/browser/ui/views/side_panel/side_panel_resize_area.h
+@@ -8,7 +8,7 @@
+ #include <optional>
+ 
+ #include "base/memory/raw_ptr.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/resize_area.h"
+ 
+@@ -20,13 +20,13 @@ class SidePanelResizeHandle : public ImageView {
+   METADATA_HEADER(SidePanelResizeHandle, ImageView)
+ 
+  public:
+-  explicit SidePanelResizeHandle(SidePanel* side_panel);
++  explicit SidePanelResizeHandle(RightSidePanel* side_panel);
+ 
+   // ImageView:
+   void OnThemeChanged() override;
+ 
+  private:
+-  raw_ptr<SidePanel> side_panel_;
++  raw_ptr<RightSidePanel> side_panel_;
+ };
+ 
+ // ResizeArea with custom Layout override to draw on top of the Side Panel
+@@ -36,7 +36,7 @@ class SidePanelResizeArea : public ResizeArea {
+   METADATA_HEADER(SidePanelResizeArea, ResizeArea)
+ 
+  public:
+-  explicit SidePanelResizeArea(SidePanel* side_panel);
++  explicit SidePanelResizeArea(RightSidePanel* side_panel);
+ 
+   SidePanelResizeHandle* resize_handle_for_testing() const {
+     return resize_handle_;
+@@ -54,7 +54,7 @@ class SidePanelResizeArea : public ResizeArea {
+  private:
+   void UpdateHandleVisibility(bool visible);
+ 
+-  raw_ptr<SidePanel> side_panel_;
++  raw_ptr<RightSidePanel> side_panel_;
+   raw_ptr<SidePanelResizeHandle> resize_handle_;
+ };
+ 
+diff --git a/chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_browsertest.cc b/chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_browsertest.cc
+index bfc8df2ee63225961d2d1c21a940aa05736d7193..9952e987db697287f8d8d0c6fff4c32a21a1329c 100644
+--- a/chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_browsertest.cc
++++ b/chrome/browser/ui/views/side_panel/tabs_from_other_devices/tabs_from_other_devices_side_panel_browsertest.cc
+@@ -15,7 +15,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_enums.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+ #include "content/public/test/browser_test.h"
+@@ -32,7 +32,7 @@ class TabsFromOtherDevicesSidePanelBrowserTest : public InProcessBrowserTest {
+     return SidePanelCoordinator::From(browser());
+   }
+ 
+-  SidePanel* GetSidePanel() { return browser()->GetBrowserView().side_panel(); }
++  RightSidePanel* GetSidePanel() { return browser()->GetBrowserView().side_panel(); }
+ 
+  private:
+   base::test::ScopedFeatureList features_;
+diff --git a/chrome/browser/ui/views/toolbar/toolbar_view.cc b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+index 28ccd33c17acf053d77243b0750b8d1371772b68..908462251f308ef62cf72f3bcb11c5f8a815bdfc 100644
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -87,7 +87,7 @@
+ #include "chrome/browser/ui/views/page_action/page_action_view_interface.h"
+ #include "chrome/browser/ui/views/performance_controls/battery_saver_button.h"
+ #include "chrome/browser/ui/views/performance_controls/performance_intervention_button.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/tabs/glic/glic_and_actor_buttons_container.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip.h"
+ #include "chrome/browser/ui/views/tabs/tab_strip_controller.h"
+diff --git a/chrome/browser/ui/views/user_education/help_bubble_factory_webui_interactive_uitest.cc b/chrome/browser/ui/views/user_education/help_bubble_factory_webui_interactive_uitest.cc
+index 5f615ee2b735f0d228196fbf075b016020f89633..7f67c45d194bb0c30e13b63c9aaec24ed9cb6e2d 100644
+--- a/chrome/browser/ui/views/user_education/help_bubble_factory_webui_interactive_uitest.cc
++++ b/chrome/browser/ui/views/user_education/help_bubble_factory_webui_interactive_uitest.cc
+@@ -20,7 +20,7 @@
+ #include "chrome/browser/ui/toolbar/bookmark_sub_menu_model.h"
+ #include "chrome/browser/ui/toolbar/reading_list_sub_menu_model.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+-#include "chrome/browser/ui/views/side_panel/side_panel.h"
++#include "chrome/browser/ui/views/side_panel/right_side_panel.h"
+ #include "chrome/browser/ui/views/side_panel/side_panel_coordinator.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/user_education/user_education_service.h"
+@@ -376,7 +376,7 @@ IN_PROC_BROWSER_TEST_F(HelpBubbleFactoryRtlWebUIInteractiveUiTest,
+                     })),
+       ShowHelpBubble(kSidePanelElementName),
+       WithView(kSidePanelElementId,
+-               [](SidePanel* side_panel) {
++               [](RightSidePanel* side_panel) {
+                  side_panel->OnResize(-50, true);
+                  side_panel->GetWidget()->LayoutRootViewIfNecessary();
+                }),
+diff --git a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+index e44f8214c7aa255acc6820096223555c8a0ad3bf..070bb574fef1b2286cb5746cd39fd751c4417aea 100644
+--- a/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
++++ b/chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+@@ -10,7 +10,6 @@
+ #include "base/feature_list.h"
+ #include "base/i18n/message_formatter.h"
+ #include "base/i18n/number_formatting.h"
+-#include "base/json/json_writer.h"
+ #include "base/strings/escape.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -47,7 +46,6 @@
+ #include "chrome/browser/subscription_eligibility/subscription_eligibility_service_factory.h"
+ #include "chrome/browser/sync/sync_service_factory.h"
+ #include "chrome/browser/ui/managed_ui.h"
+-#include "chrome/browser/ui/side_panel/side_panel_prefs.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+@@ -673,13 +671,6 @@ void AddAppearanceStrings(content::WebUIDataSource* html_source,
+   html_source->AddBoolean("showCtrlTabMru",
+                           base::FeatureList::IsEnabled(features::kCtrlTabMru));
+ 
+-  std::string configurable_alignments_json;
+-  base::JSONWriter::Write(
+-      side_panel_prefs::GetConfigurableSidePanelAlignments(profile),
+-      &configurable_alignments_json);
+-  html_source->AddString("configurableSidePanelAlignments",
+-                         configurable_alignments_json);
+-
+ #if BUILDFLAG(IS_LINUX)
+   bool show_custom_chrome_frame = ui::OzonePlatform::GetInstance()
+                                       ->GetPlatformRuntimeProperties()
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+index d4563adad3af9c4797ebad88bcc3733a89f1b958..476cd17a7590d89a6f0cd682ba8b1f70158e1a6c 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+@@ -100,7 +100,7 @@ void WebUIBrowserSidePanelUI::Show(
+     // TODO(webium): Implement the following:
+     // If the side panel is in the process of closing, show it instead.
+     // if (browser_view_->contents_height_side_panel()->state() ==
+-    // SidePanel::State::kClosing) {
++    // RightSidePanel::State::kClosing) {
+     // browser_view_->contents_height_side_panel()->Open(/*animated=*/true);
+     // NotifyPinnedContainerOfActiveStateChange(entry->key(), true);
+     // }
+diff --git a/content/browser/devtools/devtools_agent_host_impl.cc b/content/browser/devtools/devtools_agent_host_impl.cc
+index 6af038638d0b67752e9229b95f688aa986f07afb..937912f4db7cf83c9f9be541c0e58854a9e0362f 100644
+--- a/content/browser/devtools/devtools_agent_host_impl.cc
++++ b/content/browser/devtools/devtools_agent_host_impl.cc
+@@ -7,12 +7,23 @@
+ #include <map>
+ #include <vector>
+ 
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_POSIX)
++#include <unistd.h>
++#endif
++
+ #include "base/command_line.h"
++#include "base/compiler_specific.h"
++#include "base/files/file_path.h"
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/memory/ref_counted_memory.h"
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/observer_list.h"
++#include "base/process/launch.h"
++#include "base/process/process.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_view_util.h"
+@@ -182,13 +193,15 @@ DevToolsAgentHost::List DevToolsAgentHost::GetOrCreateAll() {
+   List result;
+   SharedWorkerDevToolsAgentHost::List shared_list;
+   SharedWorkerDevToolsManager::GetInstance()->AddAllAgentHosts(&shared_list);
+-  for (const auto& host : shared_list)
++  for (const auto& host : shared_list) {
+     result.push_back(host);
++  }
+ 
+   ServiceWorkerDevToolsAgentHost::List service_list;
+   ServiceWorkerDevToolsManager::GetInstance()->AddAllAgentHosts(&service_list);
+-  for (const auto& host : service_list)
++  for (const auto& host : service_list) {
+     result.push_back(host);
++  }
+ 
+   DedicatedWorkerDevToolsAgentHost::AddAllAgentHosts(&result);
+   RenderFrameDevToolsAgentHost::AddAllAgentHosts(&result);
+@@ -238,6 +251,54 @@ void DevToolsAgentHost::StartRemoteDebuggingPipeHandler(
+       read_fd, write_fd, std::move(on_disconnect)));
+ }
+ 
++// static
++void DevToolsAgentHost::StartCdpHostProcess(const base::FilePath& host_path,
++                                            base::OnceClosure on_disconnect) {
++#if BUILDFLAG(IS_POSIX)
++  int to_host[2];
++  int from_host[2];
++  if (UNSAFE_TODO(pipe(to_host)) != 0) {
++    LOG(ERROR) << "Failed to create the CDP host input pipe";
++    std::move(on_disconnect).Run();
++    return;
++  }
++  if (UNSAFE_TODO(pipe(from_host)) != 0) {
++    LOG(ERROR) << "Failed to create the CDP host output pipe";
++    close(to_host[0]);
++    close(to_host[1]);
++    std::move(on_disconnect).Run();
++    return;
++  }
++
++  base::LaunchOptions options;
++  options.fds_to_remap.emplace_back(to_host[0], STDIN_FILENO);
++  options.fds_to_remap.emplace_back(from_host[1], STDOUT_FILENO);
++
++  base::Process process =
++      base::LaunchProcess(base::CommandLine(host_path), options);
++
++  close(to_host[0]);
++  close(from_host[1]);
++
++  if (!process.IsValid()) {
++    LOG(ERROR) << "Failed to launch the CDP host process: " << host_path;
++    close(to_host[1]);
++    close(from_host[0]);
++    std::move(on_disconnect).Run();
++    return;
++  }
++
++  static base::NoDestructor<base::Process> host_process(std::move(process));
++
++  SetDevToolsPipeHandler(std::make_unique<DevToolsPipeHandler>(
++      from_host[0], to_host[1], std::move(on_disconnect),
++      DevToolsPipeHandler::ProtocolMode::kLengthPrefixed));
++#else
++  LOG(ERROR) << "--cdp-host-process is only supported on POSIX";
++  std::move(on_disconnect).Run();
++#endif
++}
++
+ // static
+ void DevToolsAgentHost::StopRemoteDebuggingServer() {
+   SetDevToolsHttpHandler(nullptr);
+@@ -270,8 +331,9 @@ DevToolsAgentHostImpl::~DevToolsAgentHostImpl() {
+ scoped_refptr<DevToolsAgentHostImpl> DevToolsAgentHostImpl::GetForId(
+     const std::string& id) {
+   auto it = GetDevtoolsInstances().find(id);
+-  if (it == GetDevtoolsInstances().end())
++  if (it == GetDevtoolsInstances().end()) {
+     return nullptr;
++  }
+   return it->second;
+ }
+ 
+@@ -286,8 +348,9 @@ scoped_refptr<DevToolsAgentHost> DevToolsAgentHost::Forward(
+     const std::string& id,
+     std::unique_ptr<DevToolsExternalAgentProxyDelegate> delegate) {
+   scoped_refptr<DevToolsAgentHost> result = DevToolsAgentHost::GetForId(id);
+-  if (result)
++  if (result) {
+     return result;
++  }
+   return new ForwardingAgentHost(id, std::move(delegate));
+ }
+ 
+@@ -342,24 +405,28 @@ bool DevToolsAgentHostImpl::AttachInternal(
+   sessions_.push_back(session);
+   DCHECK(!session_by_client_.contains(session->GetClient()));
+   session_by_client_.emplace(session->GetClient(), std::move(session_owned));
+-  if (sessions_.size() == 1)
++  if (sessions_.size() == 1) {
+     NotifyAttached();
+-  if (manager->delegate())
++  }
++  if (manager->delegate()) {
+     manager->delegate()->ClientAttached(session);
++  }
+   return true;
+ }
+ 
+ bool DevToolsAgentHostImpl::AttachClient(DevToolsAgentHostClient* client) {
+-  if (SessionByClient(client))
++  if (SessionByClient(client)) {
+     return false;
++  }
+   return AttachInternal(
+       std::make_unique<DevToolsSession>(client, GetSessionMode()));
+ }
+ 
+ bool DevToolsAgentHostImpl::DetachClient(DevToolsAgentHostClient* client) {
+   DevToolsSession* session = SessionByClient(client);
+-  if (!session)
++  if (!session) {
+     return false;
++  }
+   scoped_refptr<DevToolsAgentHostImpl> protect(this);
+   DetachInternal(session);
+   return true;
+@@ -369,8 +436,9 @@ void DevToolsAgentHostImpl::DispatchProtocolMessage(
+     DevToolsAgentHostClient* client,
+     base::span<const uint8_t> message) {
+   DevToolsSession* session = SessionByClient(client);
+-  if (session)
++  if (session) {
+     session->DispatchProtocolMessage(message);
++  }
+ }
+ 
+ void DevToolsAgentHostImpl::DetachInternal(DevToolsSession* session) {
+@@ -383,8 +451,9 @@ void DevToolsAgentHostImpl::DetachInternal(DevToolsSession* session) {
+   session_by_client_.erase(session->GetClient());
+   DetachSession(session);
+   DevToolsManager* manager = DevToolsManager::GetInstance();
+-  if (manager->delegate())
++  if (manager->delegate()) {
+     manager->delegate()->ClientDetached(session);
++  }
+   if (sessions_.empty()) {
+     io_context_.DiscardAllStreams();
+     NotifyDetached();
+@@ -455,11 +524,9 @@ WebContents* DevToolsAgentHostImpl::GetWebContents() {
+   return nullptr;
+ }
+ 
+-void DevToolsAgentHostImpl::DisconnectWebContents() {
+-}
++void DevToolsAgentHostImpl::DisconnectWebContents() {}
+ 
+-void DevToolsAgentHostImpl::ConnectWebContents(WebContents* wc) {
+-}
++void DevToolsAgentHostImpl::ConnectWebContents(WebContents* wc) {}
+ 
+ DevToolsSession::Mode DevToolsAgentHostImpl::GetSessionMode() {
+   return DevToolsSession::Mode::kDoesNotSupportTabTarget;
+@@ -549,14 +616,16 @@ void DevToolsAgentHost::AddObserver(DevToolsAgentHostObserver* observer) {
+   }
+ 
+   GetDevtoolsObservers().AddObserver(observer);
+-  for (const auto& id_host : GetDevtoolsInstances())
++  for (const auto& id_host : GetDevtoolsInstances()) {
+     observer->DevToolsAgentHostCreated(id_host.second);
++  }
+ }
+ 
+ // static
+ void DevToolsAgentHost::RemoveObserver(DevToolsAgentHostObserver* observer) {
+-  if (observer->ShouldForceDevToolsAgentHostCreation())
++  if (observer->ShouldForceDevToolsAgentHostCreation()) {
+     DevToolsAgentHostImpl::s_force_creation_count_--;
++  }
+   GetDevtoolsObservers().RemoveObserver(observer);
+ }
+ 
+@@ -572,34 +641,40 @@ std::string DevToolsAgentHostImpl::GetSubtype() {
+ void DevToolsAgentHostImpl::NotifyCreated() {
+   DCHECK(!GetDevtoolsInstances().contains(id_));
+   GetDevtoolsInstances()[id_] = this;
+-  for (auto& observer : GetDevtoolsObservers())
++  for (auto& observer : GetDevtoolsObservers()) {
+     observer.DevToolsAgentHostCreated(this);
++  }
+ }
+ 
+ void DevToolsAgentHostImpl::NotifyNavigated() {
+-  for (auto& observer : GetDevtoolsObservers())
++  for (auto& observer : GetDevtoolsObservers()) {
+     observer.DevToolsAgentHostNavigated(this);
++  }
+ }
+ 
+ void DevToolsAgentHostImpl::NotifyAttached() {
+-  for (auto& observer : GetDevtoolsObservers())
++  for (auto& observer : GetDevtoolsObservers()) {
+     observer.DevToolsAgentHostAttached(this);
++  }
+ }
+ 
+ void DevToolsAgentHostImpl::NotifyDetached() {
+-  for (auto& observer : GetDevtoolsObservers())
++  for (auto& observer : GetDevtoolsObservers()) {
+     observer.DevToolsAgentHostDetached(this);
++  }
+ }
+ 
+ void DevToolsAgentHostImpl::NotifyCrashed(base::TerminationStatus status) {
+-  for (auto& observer : GetDevtoolsObservers())
++  for (auto& observer : GetDevtoolsObservers()) {
+     observer.DevToolsAgentHostCrashed(this, status);
++  }
+ }
+ 
+ void DevToolsAgentHostImpl::NotifyDestroyed() {
+   DCHECK(GetDevtoolsInstances().contains(id_));
+-  for (auto& observer : GetDevtoolsObservers())
++  for (auto& observer : GetDevtoolsObservers()) {
+     observer.DevToolsAgentHostDestroyed(this);
++  }
+   GetDevtoolsInstances().erase(id_);
+ }
+ 
+diff --git a/content/browser/devtools/devtools_pipe_handler.cc b/content/browser/devtools/devtools_pipe_handler.cc
+index b15a18e51478f8ce88adf727954e0e98e56bd80c..a7c83e6e241699ec0f046c15f57f6bb13860427b 100644
+--- a/content/browser/devtools/devtools_pipe_handler.cc
++++ b/content/browser/devtools/devtools_pipe_handler.cc
+@@ -29,7 +29,9 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/message_loop/message_pump_type.h"
++#include "base/numerics/safe_conversions.h"
+ #include "base/strings/string_util.h"
++#include "base/sys_byteorder.h"
+ #include "base/synchronization/atomic_flag.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -307,6 +309,61 @@ class PipeWriterCBOR : public PipeWriterBase {
+   }
+ };
+ 
++class PipeWriterLengthPrefixed : public PipeWriterBase {
++ public:
++  explicit PipeWriterLengthPrefixed(int write_fd) : PipeWriterBase(write_fd) {}
++
++  void WriteIntoPipe(std::string message) override {
++    const uint32_t size =
++        base::HostToNet32(base::checked_cast<uint32_t>(message.size()));
++    WriteBytes(reinterpret_cast<const char*>(&size), sizeof(size));
++    WriteBytes(message.data(), message.size());
++  }
++};
++
++class PipeReaderLengthPrefixed : public PipeReaderBase {
++ public:
++  PipeReaderLengthPrefixed(base::WeakPtr<DevToolsPipeHandler> devtools_handler,
++                           int read_fd)
++      : PipeReaderBase(std::move(devtools_handler), read_fd) {}
++
++ private:
++  static constexpr size_t kHeaderSize = sizeof(uint32_t);
++  static constexpr size_t kChunkSize = 4096;
++  static constexpr size_t kMaxMessageSize = 256 * 1024 * 1024;
++
++  void ReadLoopInternal() override {
++    std::vector<char> chunk(kChunkSize);
++    while (true) {
++      size_t bytes_read = ReadBytes(chunk.data(), chunk.size(), false);
++      if (!bytes_read)
++        break;
++      buffer_.append(chunk.data(), bytes_read);
++
++      while (buffer_.size() >= kHeaderSize) {
++        uint32_t message_size = 0;
++        UNSAFE_TODO(memcpy(&message_size, buffer_.data(), kHeaderSize));
++        message_size = base::NetToHost32(message_size);
++
++        if (message_size > kMaxMessageSize) {
++          LOG(ERROR) << "CDP host sent a message of " << message_size
++                     << " bytes, which exceeds the limit";
++          return;
++        }
++        if (buffer_.size() < kHeaderSize + message_size)
++          break;
++
++        base::span<const uint8_t> body =
++            base::as_byte_span(buffer_).subspan(kHeaderSize, message_size);
++        HandleMessage(std::vector<uint8_t>(body.begin(), body.end()));
++        buffer_.erase(0, kHeaderSize + message_size);
++      }
++    }
++  }
++
++  std::string buffer_;
++};
++
+ class PipeReaderASCIIZ : public PipeReaderBase {
+  public:
+   PipeReaderASCIIZ(base::WeakPtr<DevToolsPipeHandler> devtools_handler,
+@@ -395,7 +452,8 @@ class PipeReaderCBOR : public PipeReaderBase {
+ 
+ DevToolsPipeHandler::DevToolsPipeHandler(int read_fd,
+                                          int write_fd,
+-                                         base::OnceClosure on_disconnect)
++                                         base::OnceClosure on_disconnect,
++                                         std::optional<ProtocolMode> mode)
+     : on_disconnect_(std::move(on_disconnect)),
+       read_fd_(read_fd),
+       write_fd_(write_fd) {
+@@ -403,11 +461,15 @@ DevToolsPipeHandler::DevToolsPipeHandler(int read_fd,
+       nullptr, DevToolsAgentHost::CreateServerSocketCallback());
+   browser_target_->AttachClient(this);
+ 
+-  std::string str_mode = base::ToLowerASCII(
+-      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+-          switches::kRemoteDebuggingPipe));
+-  mode_ = str_mode == "cbor" ? DevToolsPipeHandler::ProtocolMode::kCBOR
+-                             : DevToolsPipeHandler::ProtocolMode::kASCIIZ;
++  if (mode.has_value()) {
++    mode_ = *mode;
++  } else {
++    std::string str_mode = base::ToLowerASCII(
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            switches::kRemoteDebuggingPipe));
++    mode_ = str_mode == "cbor" ? DevToolsPipeHandler::ProtocolMode::kCBOR
++                               : DevToolsPipeHandler::ProtocolMode::kASCIIZ;
++  }
+ 
+   switch (mode_) {
+     case ProtocolMode::kASCIIZ:
+@@ -421,6 +483,12 @@ DevToolsPipeHandler::DevToolsPipeHandler(int read_fd,
+           weak_factory_.GetWeakPtr(), read_fd_);
+       pipe_writer_ = std::make_unique<PipeWriterCBOR>(write_fd_);
+       break;
++
++    case ProtocolMode::kLengthPrefixed:
++      pipe_reader_ = std::make_unique<PipeReaderLengthPrefixed>(
++          weak_factory_.GetWeakPtr(), read_fd_);
++      pipe_writer_ = std::make_unique<PipeWriterLengthPrefixed>(write_fd_);
++      break;
+   }
+   if (!pipe_reader_->Start() || !pipe_writer_->Start())
+     Shutdown();
+diff --git a/content/browser/devtools/devtools_pipe_handler.h b/content/browser/devtools/devtools_pipe_handler.h
+index 6263c0a8179681cddbd2d2f6facfb4a9c0f7422e..4fa3687a066656f7847cd25181c5311b211c8d33 100644
+--- a/content/browser/devtools/devtools_pipe_handler.h
++++ b/content/browser/devtools/devtools_pipe_handler.h
+@@ -5,6 +5,8 @@
+ #ifndef CONTENT_BROWSER_DEVTOOLS_DEVTOOLS_PIPE_HANDLER_H_
+ #define CONTENT_BROWSER_DEVTOOLS_DEVTOOLS_PIPE_HANDLER_H_
+ 
++#include <optional>
++
+ #include "base/containers/span.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
+@@ -17,9 +19,19 @@ class PipeWriterBase;
+ 
+ class DevToolsPipeHandler : public DevToolsAgentHostClient {
+  public:
++  enum class ProtocolMode {
++    // Legacy text protocol format with messages separated by \0's.
++    kASCIIZ,
++    // Experimental (!) CBOR (RFC 7049) based binary format.
++    kCBOR,
++    // JSON messages preceded by a 4-byte big-endian length.
++    kLengthPrefixed,
++  };
++
+   DevToolsPipeHandler(int read_fd,
+                       int write_fd,
+-                      base::OnceClosure on_disconnect);
++                      base::OnceClosure on_disconnect,
++                      std::optional<ProtocolMode> mode = std::nullopt);
+ 
+   DevToolsPipeHandler(const DevToolsPipeHandler&) = delete;
+   DevToolsPipeHandler& operator=(const DevToolsPipeHandler&) = delete;
+@@ -41,13 +53,6 @@ class DevToolsPipeHandler : public DevToolsAgentHostClient {
+   void Shutdown();
+ 
+  private:
+-  enum class ProtocolMode {
+-    // Legacy text protocol format with messages separated by \0's.
+-    kASCIIZ,
+-    // Experimental (!) CBOR (RFC 7049) based binary format.
+-    kCBOR
+-  };
+-
+   ProtocolMode mode_;
+   base::OnceClosure on_disconnect_;
+ 
+diff --git a/content/public/browser/devtools_agent_host.h b/content/public/browser/devtools_agent_host.h
+index 43f5ae84506332eec7104b84761a3fb127d9b61a..0fe6b23cce8573856399b1e1084e0e9b61e51a5b 100644
+--- a/content/public/browser/devtools_agent_host.h
++++ b/content/public/browser/devtools_agent_host.h
+@@ -162,6 +162,11 @@ class CONTENT_EXPORT DevToolsAgentHost
+   // Starts remote debugging for browser target for the given fd=3
+   // for reading and fd=4 for writing remote debugging messages.
+   static void StartRemoteDebuggingPipeHandler(base::OnceClosure on_disconnect);
++
++  // Launches |host_path| and speaks the DevTools protocol to it over its
++  // stdin/stdout, length-prefixed.
++  static void StartCdpHostProcess(const base::FilePath& host_path,
++                                  base::OnceClosure on_disconnect);
+   static void StopRemoteDebuggingPipeHandler();
+ 
+   // Observer is notified about changes in DevToolsAgentHosts.
+diff --git a/content/public/common/content_switches.cc b/content/public/common/content_switches.cc
+index 86755253c2d71135b99c745704c653d2a5344812..54cfb4cf4809f145ac0d656f273b5c2d2345e6dd 100644
+--- a/content/public/common/content_switches.cc
++++ b/content/public/common/content_switches.cc
+@@ -12,7 +12,7 @@ namespace switches {
+ 
+ // By default, file:// URIs cannot read other file:// URIs. This is an
+ // override for developers who need the old behavior for testing.
+-const char kAllowFileAccessFromFiles[]      = "allow-file-access-from-files";
++const char kAllowFileAccessFromFiles[] = "allow-file-access-from-files";
+ 
+ // Enables TLS/SSL errors on localhost to be ignored (no interstitial,
+ // no blocking of requests).
+@@ -34,13 +34,13 @@ const char kAutoAcceptCameraAndMicrophoneCapture[] =
+     "auto-accept-camera-and-microphone-capture";
+ 
+ // Causes the browser process to crash on startup.
+-const char kBrowserCrashTest[]              = "crash-test";
++const char kBrowserCrashTest[] = "crash-test";
+ 
+ // Causes the browser process to display a dialog on launch.
+-const char kBrowserStartupDialog[]          = "browser-startup-dialog";
++const char kBrowserStartupDialog[] = "browser-startup-dialog";
+ 
+ // Path to the exe to run for the renderer and plugin subprocesses.
+-const char kBrowserSubprocessPath[]         = "browser-subprocess-path";
++const char kBrowserSubprocessPath[] = "browser-subprocess-path";
+ 
+ // Tells whether the code is running browser tests (this changes the startup URL
+ // used by the content shell and also disables features that can make tests
+@@ -59,16 +59,16 @@ const char kChangeStackGuardOnForkEnabled[] = "enable";
+ const char kChangeStackGuardOnForkDisabled[] = "disable";
+ 
+ // Disable antialiasing on 2d canvas.
+-const char kDisable2dCanvasAntialiasing[]   = "disable-canvas-aa";
++const char kDisable2dCanvasAntialiasing[] = "disable-canvas-aa";
+ 
+ // Disables client-visible 3D APIs, in particular WebGL.
+ // This is controlled by policy and is kept separate from the other
+ // enable/disable switches to avoid accidentally regressing the policy
+ // support for controlling access to these APIs.
+-const char kDisable3DAPIs[]                 = "disable-3d-apis";
++const char kDisable3DAPIs[] = "disable-3d-apis";
+ 
+ // Disable gpu-accelerated 2d canvas.
+-const char kDisableAccelerated2dCanvas[]    = "disable-accelerated-2d-canvas";
++const char kDisableAccelerated2dCanvas[] = "disable-accelerated-2d-canvas";
+ 
+ // Enable in-progress canvas 2d API methods BeginLayer and EndLayer.
+ const char kEnableCanvas2DLayers[] = "canvas-2d-layers";
+@@ -85,7 +85,7 @@ const char kDisableAcceleratedVideoEncode[] =
+ 
+ // Disable limits on the number of backing stores. Can prevent blinking for
+ // users with many windows/tabs and lots of memory.
+-const char kDisableBackingStoreLimit[]      = "disable-backing-store-limit";
++const char kDisableBackingStoreLimit[] = "disable-backing-store-limit";
+ 
+ // Disable backgrounding renders for occluded windows. Done for tests to avoid
+ // nondeterministic behavior.
+@@ -103,7 +103,7 @@ const char kDisableBackForwardCache[] = "disable-back-forward-cache";
+ // Use names from runtime_enabled_features.json5, separated by commas.
+ // Applied after kEnableBlinkFeatures, and after other flags that change these
+ // features.
+-const char kDisableBlinkFeatures[]          = "disable-blink-features";
++const char kDisableBlinkFeatures[] = "disable-blink-features";
+ 
+ // Disable the per-domain blocking for 3D APIs after GPU reset.
+ // This switch is intended only for tests.
+@@ -120,7 +120,7 @@ const char kDisableWebGL[] = "disable-webgl";
+ const char kDisableWebGL2[] = "disable-webgl2";
+ 
+ // Disable FileSystem API.
+-const char kDisableFileSystem[]             = "disable-file-system";
++const char kDisableFileSystem[] = "disable-file-system";
+ 
+ // Disable user gesture requirement for presentation.
+ const char kDisableGestureRequirementForPresentation[] =
+@@ -128,13 +128,13 @@ const char kDisableGestureRequirementForPresentation[] =
+ 
+ // Disables GPU hardware acceleration.  If software renderer is not in place,
+ // then the GPU process won't launch.
+-const char kDisableGpu[]                    = "disable-gpu";
++const char kDisableGpu[] = "disable-gpu";
+ 
+ // Prevent the compositor from using its GPU implementation.
+-const char kDisableGpuCompositing[]         = "disable-gpu-compositing";
++const char kDisableGpuCompositing[] = "disable-gpu-compositing";
+ 
+ // Disable proactive early init of GPU process.
+-const char kDisableGpuEarlyInit[]           = "disable-gpu-early-init";
++const char kDisableGpuEarlyInit[] = "disable-gpu-early-init";
+ 
+ // Do not force that all compositor resources be backed by GPU memory buffers.
+ const char kDisableGpuMemoryBufferCompositorResources[] =
+@@ -169,25 +169,25 @@ const char kDisableIgnoreDuplicateNavsForTesting[] =
+     "disable-ignore-duplicate-navs-for-testing";
+ 
+ // Disable the RenderThread's HistogramCustomizer.
+-const char kDisableHistogramCustomizer[]    = "disable-histogram-customizer";
++const char kDisableHistogramCustomizer[] = "disable-histogram-customizer";
+ 
+ // Don't kill a child process when it sends a bad IPC message.  Apart
+ // from testing, it is a bad idea from a security perspective to enable
+ // this switch.
+-const char kDisableKillAfterBadIPC[]        = "disable-kill-after-bad-ipc";
++const char kDisableKillAfterBadIPC[] = "disable-kill-after-bad-ipc";
+ 
+ // Disables LCD text.
+-const char kDisableLCDText[]                = "disable-lcd-text";
++const char kDisableLCDText[] = "disable-lcd-text";
+ 
+ // Disable LocalStorage.
+-const char kDisableLocalStorage[]           = "disable-local-storage";
++const char kDisableLocalStorage[] = "disable-local-storage";
+ 
+ // Force logging to be disabled.  Logging is enabled by default in debug
+ // builds.
+-const char kDisableLogging[]                = "disable-logging";
++const char kDisableLogging[] = "disable-logging";
+ 
+ // Disables using CODECAPI_AVLowLatencyMode when creating DXVA decoders.
+-const char kDisableLowLatencyDxva[]         = "disable-low-latency-dxva";
++const char kDisableLowLatencyDxva[] = "disable-low-latency-dxva";
+ 
+ // Disables renaming the main browser thread to "CrBrowserMain" during browser
+ // startup. The internally mapped thread name is being emitted to Perfetto
+@@ -206,7 +206,7 @@ const char kDisableNewContentRenderingTimeout[] =
+     "disable-new-content-rendering-timeout";
+ 
+ // Disables the Web Notification and the Push APIs.
+-const char kDisableNotifications[]          = "disable-notifications";
++const char kDisableNotifications[] = "disable-notifications";
+ 
+ // Disables the activation of browser and web accessibility via interactions
+ // with the platform's accessibility integration (i.e., a screenreader will not
+@@ -215,66 +215,66 @@ const char kDisablePlatformAccessibilityIntegration[] =
+     "disable-platform-accessibility-integration";
+ 
+ // Disables the Presentation API.
+-const char kDisablePresentationAPI[]        = "disable-presentation-api";
++const char kDisablePresentationAPI[] = "disable-presentation-api";
+ 
+ // Disables throttling of history.pushState/replaceState calls.
+ const char kDisablePushStateThrottle[] = "disable-pushstate-throttle";
+ 
+ // Taints all <canvas> elements, regardless of origin.
+-const char kDisableReadingFromCanvas[]      = "disable-reading-from-canvas";
++const char kDisableReadingFromCanvas[] = "disable-reading-from-canvas";
+ 
+ // Disables remote web font support. SVG font should always work whether this
+ // option is specified or not.
+-const char kDisableRemoteFonts[]            = "disable-remote-fonts";
++const char kDisableRemoteFonts[] = "disable-remote-fonts";
+ 
+ // Disables the RemotePlayback API.
+-const char kDisableRemotePlaybackAPI[]      = "disable-remote-playback-api";
++const char kDisableRemotePlaybackAPI[] = "disable-remote-playback-api";
+ 
+ // Prevent renderer process backgrounding when set.
+-const char kDisableRendererBackgrounding[]  = "disable-renderer-backgrounding";
++const char kDisableRendererBackgrounding[] = "disable-renderer-backgrounding";
+ 
+ // Whether the ResourceScheduler is disabled.  Note this is only useful for C++
+ // Headless embedders who need to implement their own resource scheduling.
+ const char kDisableResourceScheduler[] = "disable-resource-scheduler";
+ 
+ // Disable shared workers.
+-const char kDisableSharedWorkers[]          = "disable-shared-workers";
++const char kDisableSharedWorkers[] = "disable-shared-workers";
+ 
+ // Do not use runtime-detected high-end CPU optimizations in Skia.  This is
+ // useful for forcing a baseline code path for e.g. web tests.
+-const char kDisableSkiaRuntimeOpts[]        = "disable-skia-runtime-opts";
++const char kDisableSkiaRuntimeOpts[] = "disable-skia-runtime-opts";
+ 
+ // Disable smooth scrolling for testing.
+-const char kDisableSmoothScrolling[]        = "disable-smooth-scrolling";
++const char kDisableSmoothScrolling[] = "disable-smooth-scrolling";
+ 
+ // Disables the use of a 3D software rasterizer.
+-const char kDisableSoftwareRasterizer[]     = "disable-software-rasterizer";
++const char kDisableSoftwareRasterizer[] = "disable-software-rasterizer";
+ 
+ // Disables the Web Speech API (both speech recognition and synthesis).
+-const char kDisableSpeechAPI[]              = "disable-speech-api";
++const char kDisableSpeechAPI[] = "disable-speech-api";
+ 
+ // Disables the speech synthesis part of Web Speech API.
+-const char kDisableSpeechSynthesisAPI[]     = "disable-speech-synthesis-api";
++const char kDisableSpeechSynthesisAPI[] = "disable-speech-synthesis-api";
+ 
+ // Disable multithreaded GPU compositing of web content.
+-const char kDisableThreadedCompositing[]    = "disable-threaded-compositing";
++const char kDisableThreadedCompositing[] = "disable-threaded-compositing";
+ 
+ // Disable V8 idle tasks.
+-const char kDisableV8IdleTasks[]            = "disable-v8-idle-tasks";
++const char kDisableV8IdleTasks[] = "disable-v8-idle-tasks";
+ 
+ // Don't enforce the same-origin policy; meant for website testing only.
+ // This switch has no effect unless --user-data-dir (as defined by the content
+ // embedder) is also present.
+-const char kDisableWebSecurity[]            = "disable-web-security";
++const char kDisableWebSecurity[] = "disable-web-security";
+ 
+ // Disable the video decoder from drawing directly to a texture.
+-const char kDisableZeroCopyDxgiVideo[]      = "disable-zero-copy-dxgi-video";
++const char kDisableZeroCopyDxgiVideo[] = "disable-zero-copy-dxgi-video";
+ 
+ // Specifies if the |DOMAutomationController| needs to be bound in the
+ // renderer. This binding happens on per-frame basis and hence can potentially
+ // be a performance bottleneck. One should only enable it when automating dom
+ // based tests.
+-const char kDomAutomationController[]       = "dom-automation";
++const char kDomAutomationController[] = "dom-automation";
+ 
+ // Disable antialiasing on 2d canvas clips
+ const char kDisable2dCanvasClipAntialiasing[] = "disable-2d-canvas-clip-aa";
+@@ -284,13 +284,13 @@ const char kDisable2dCanvasClipAntialiasing[] = "disable-2d-canvas-clip-aa";
+ const char kDisableYUVImageDecoding[] = "disable-yuv-image-decoding";
+ 
+ // Enables LCD text.
+-const char kEnableLCDText[]                 = "enable-lcd-text";
++const char kEnableLCDText[] = "enable-lcd-text";
+ 
+ // Enable one or more Blink runtime-enabled features.
+ // Use names from runtime_enabled_features.json5, separated by commas.
+ // Applied before kDisableBlinkFeatures, and after other flags that change these
+ // features.
+-const char kEnableBlinkFeatures[]           = "enable-blink-features";
++const char kEnableBlinkFeatures[] = "enable-blink-features";
+ 
+ // Enable native caret browsing, in which a moveable cursor is placed on a web
+ // page, allowing a user to select and navigate through non-editable text using
+@@ -343,7 +343,7 @@ const char kEnableIsolatedWebAppsInRenderer[] =
+ 
+ // Force logging to be enabled.  Logging is disabled by default in release
+ // builds.
+-const char kEnableLogging[]                 = "enable-logging";
++const char kEnableLogging[] = "enable-logging";
+ 
+ // Enables the type, downlinkMax attributes of the NetInfo API. Also, enables
+ // triggering of change attribute of the NetInfo API when there is a change in
+@@ -381,13 +381,13 @@ const char kDisallowV8FeatureFlagOverrides[] =
+ const char kEnableServiceBinaryLauncher[] = "enable-service-binary-launcher";
+ 
+ // Enables the Skia benchmarking extension.
+-const char kEnableSkiaBenchmarking[]        = "enable-skia-benchmarking";
++const char kEnableSkiaBenchmarking[] = "enable-skia-benchmarking";
+ 
+ // On platforms that support it, enables smooth scroll animation.
+-const char kEnableSmoothScrolling[]         = "enable-smooth-scrolling";
++const char kEnableSmoothScrolling[] = "enable-smooth-scrolling";
+ 
+ // Enable spatial navigation
+-const char kEnableSpatialNavigation[]       = "enable-spatial-navigation";
++const char kEnableSpatialNavigation[] = "enable-spatial-navigation";
+ 
+ // Blocks all insecure requests from secure contexts, and prevents the user
+ // from overriding that decision.
+@@ -411,10 +411,10 @@ const char kEnableUserMediaScreenCapturing[] =
+ // Enables the use of the @viewport CSS rule, which allows
+ // pages to control aspects of their own layout. This also turns on touch-screen
+ // pinch gestures.
+-const char kEnableViewport[]                = "enable-viewport";
++const char kEnableViewport[] = "enable-viewport";
+ 
+ // Enable the Vtune profiler support.
+-const char kEnableVtune[]                   = "enable-vtune-support";
++const char kEnableVtune[] = "enable-vtune-support";
+ 
+ // Enables WebGL developer extensions which are not generally exposed
+ // to the web platform.
+@@ -441,27 +441,27 @@ const char kGpuClientId[] = "gpu-client-id";
+ 
+ // Extra command line options for launching the GPU process (normally used
+ // for debugging). Use like renderer-cmd-prefix.
+-const char kGpuLauncher[]                   = "gpu-launcher";
++const char kGpuLauncher[] = "gpu-launcher";
+ 
+ // Makes this process a GPU sub-process.
+-const char kGpuProcess[]                    = "gpu-process";
++const char kGpuProcess[] = "gpu-process";
+ 
+ // Starts the GPU sandbox before creating a GL context.
+ const char kGpuSandboxStartEarly[] = "gpu-sandbox-start-early";
+ 
+ // Causes the GPU process to display a dialog on launch.
+-const char kGpuStartupDialog[]              = "gpu-startup-dialog";
++const char kGpuStartupDialog[] = "gpu-startup-dialog";
+ 
+ // Prevents creating scrollbars for web content. Useful for taking consistent
+ // screenshots.
+ const char kHideScrollbars[] = "hide-scrollbars";
+ 
+ // Run the GPU process as a thread in the browser process.
+-const char kInProcessGPU[]                  = "in-process-gpu";
++const char kInProcessGPU[] = "in-process-gpu";
+ 
+ // Overrides the timeout, in seconds, that a child process waits for a
+ // connection from the browser before killing itself.
+-const char kIPCConnectionTimeout[]          = "ipc-connection-timeout";
++const char kIPCConnectionTimeout[] = "ipc-connection-timeout";
+ 
+ // Require dedicated processes for a set of origins, specified as a
+ // comma-separated list. For example:
+@@ -473,7 +473,7 @@ const char kDisableJavaScriptHarmonyShipping[] =
+     "disable-javascript-harmony-shipping";
+ 
+ // Enables experimental Harmony (ECMAScript 6) features.
+-const char kJavaScriptHarmony[]             = "javascript-harmony";
++const char kJavaScriptHarmony[] = "javascript-harmony";
+ 
+ // Flag to launch tests in the browser process.
+ const char kLaunchAsBrowser[] = "as-browser";
+@@ -487,11 +487,11 @@ const char kLoadWebUIfromDisk[] = "load-webui-from-disk";
+ #endif  // BUILDFLAG(LOAD_WEBUI_FROM_DISK)
+ 
+ // Logs GPU control list decisions when enforcing blocklist rules.
+-const char kLogGpuControlListDecisions[]    = "log-gpu-control-list-decisions";
++const char kLogGpuControlListDecisions[] = "log-gpu-control-list-decisions";
+ 
+ // Sets the minimum log level. Valid values are from 0 to 3:
+ // INFO = 0, WARNING = 1, LOG_ERROR = 2, LOG_FATAL = 3.
+-const char kLoggingLevel[]                  = "log-level";
++const char kLoggingLevel[] = "log-level";
+ 
+ // Overrides the default file name to use for general-purpose logging (does not
+ // affect which events are logged).
+@@ -518,7 +518,7 @@ const char kMockCertVerifierDefaultResultForTesting[] =
+     "mock-cert-verifier-default-result-for-testing";
+ 
+ // Use a Mojo-based LocalStorage implementation.
+-const char kMojoLocalStorage[]              = "mojo-local-storage";
++const char kMojoLocalStorage[] = "mojo-local-storage";
+ 
+ // Disables the unsandboxed zygote.
+ // Note: this flag should not be used on most platforms. It is introduced
+@@ -552,7 +552,7 @@ const char kPrivateAggregationDeveloperMode[] =
+ //
+ // IMPORTANT: This isn't to be confused with --site-per-process (which is about
+ // isolation, not consolidation). You probably want the other one.
+-const char kProcessPerSite[]                = "process-per-site";
++const char kProcessPerSite[] = "process-per-site";
+ 
+ // Runs each set of script-connected tabs (i.e., a BrowsingInstance) in its own
+ // renderer process.  We default to using a renderer process for each
+@@ -561,11 +561,11 @@ const char kProcessPerSite[]                = "process-per-site";
+ // TODO(creis): This flag is currently a no-op.  We should refactor it to avoid
+ // "unnecessary" process swaps for cross-site navigations but still swap when
+ // needed for security (e.g., isolated origins).
+-const char kProcessPerTab[]                 = "process-per-tab";
++const char kProcessPerTab[] = "process-per-tab";
+ 
+ // The value of this switch determines whether the process is started as a
+ // renderer or plugin host.  If it's empty, it's the browser.
+-const char kProcessType[]                   = "type";
++const char kProcessType[] = "type";
+ 
+ // Causes Protected Audiences Bidding and Auction API to supply the provided
+ // debugging key to the trusted auction server. This tells the server that it
+@@ -597,6 +597,9 @@ const char kReduceAcceptLanguageHTTP[] = "reduce-accept-language-http";
+ // https://blog.chromium.org/2021/09/user-agent-reduction-origin-trial-and-dates.html.
+ const char kReduceUserAgentMinorVersion[] = "reduce-user-agent-minor-version";
+ 
++// Launches the specified executable as a length-prefixed CDP host process.
++const char kCdpHostProcess[] = "cdp-host-process";
++
+ // Enables remote debug over stdio pipes [in=3, out=4] or over the remote pipes
+ // specified in the 'remote-debugging-io-pipes' switch.
+ // Optionally, specifies the format for the protocol messages, can be either
+@@ -604,7 +607,7 @@ const char kReduceUserAgentMinorVersion[] = "reduce-user-agent-minor-version";
+ const char kRemoteDebuggingPipe[] = "remote-debugging-pipe";
+ 
+ // Enables remote debug over HTTP on the specified port.
+-const char kRemoteDebuggingPort[]           = "remote-debugging-port";
++const char kRemoteDebuggingPort[] = "remote-debugging-port";
+ 
+ // Enables web socket connections from the specified origins only. '*' allows
+ // any origin.
+@@ -614,10 +617,10 @@ const char kRendererClientId[] = "renderer-client-id";
+ 
+ // The contents of this flag are prepended to the renderer command line.
+ // Useful values might be "valgrind" or "xterm -e gdb --args".
+-const char kRendererCmdPrefix[]             = "renderer-cmd-prefix";
++const char kRendererCmdPrefix[] = "renderer-cmd-prefix";
+ 
+ // Causes the process to run as renderer instead of as browser.
+-const char kRendererProcess[]               = "renderer";
++const char kRendererProcess[] = "renderer";
+ 
+ // Time the browser launched the renderer process (in TimeTicks).
+ const char kRendererProcessLaunchTimeTicks[] = "launch-time-ticks";
+@@ -630,12 +633,12 @@ const char kGpuChannelRequestStartTimeTicks[] =
+ // Overrides the default/calculated limit to the number of renderer processes.
+ // Very high values for this setting can lead to high memory/resource usage
+ // or instability.
+-const char kRendererProcessLimit[]          = "renderer-process-limit";
++const char kRendererProcessLimit[] = "renderer-process-limit";
+ 
+ // Causes the renderer process to display a dialog on launch. Passing this flag
+ // also adds sandbox::policy::kNoSandbox on Windows non-official builds, since
+ // that's needed to show a dialog.
+-const char kRendererStartupDialog[]         = "renderer-startup-dialog";
++const char kRendererStartupDialog[] = "renderer-startup-dialog";
+ 
+ // Manual tests only run when --run-manual is specified. This allows writing
+ // tests that don't run automatically but are still in the same test binary.
+@@ -644,7 +647,7 @@ const char kRendererStartupDialog[]         = "renderer-startup-dialog";
+ const char kRunManualTestsFlag[] = "run-manual";
+ 
+ // Causes the process to run as a sandbox IPC subprocess.
+-const char kSandboxIPCProcess[]             = "sandbox-ipc";
++const char kSandboxIPCProcess[] = "sandbox-ipc";
+ 
+ // Enables shared array buffer on desktop, gated by an Enterprise Policy.
+ // TODO(crbug.com/40155376) Remove when migration to COOP+COEP is complete.
+@@ -665,7 +668,7 @@ const char kSharedArrayBufferUnrestrictedAccessAllowed[] =
+ const char kSharedFiles[] = "shared-files";
+ 
+ // Runs the renderer and plugins in the same process as the browser
+-const char kSingleProcess[]                 = "single-process";
++const char kSingleProcess[] = "single-process";
+ 
+ // Enforces a one-site-per-process security policy:
+ //  * Each renderer process, for its whole lifetime, is dedicated to rendering
+@@ -682,7 +685,7 @@ const char kSingleProcess[]                 = "single-process";
+ //
+ // IMPORTANT: this isn't to be confused with --process-per-site (which is about
+ // process consolidation, not isolation). You probably want this one.
+-const char kSitePerProcess[]                = "site-per-process";
++const char kSitePerProcess[] = "site-per-process";
+ 
+ // Disables site isolation.
+ //
+@@ -705,8 +708,7 @@ const char kStartFullscreen[] = "start-fullscreen";
+ // renderer. This binding happens on per-frame basis and hence can potentially
+ // be a performance bottleneck. One should only enable it when running a test
+ // that needs to access the provided statistics.
+-const char kStatsCollectionController[] =
+-    "enable-stats-collection-bindings";
++const char kStatsCollectionController[] = "enable-stats-collection-bindings";
+ 
+ // Specifies the max number of bytes that should be used by the skia font cache.
+ // If the cache needs to allocate more, skia will purge previous entries.
+@@ -721,7 +723,7 @@ const char kSkiaResourceCacheLimitMb[] = "skia-resource-cache-limit-mb";
+ const char kTargetDeviceScaleForTesting[] = "target-device-scale-for-testing";
+ 
+ // Type of the current test harness ("browser" or "ui" or "gpu").
+-const char kTestType[]                      = "test-type";
++const char kTestType[] = "test-type";
+ 
+ // Indicates that this RenderProcess is hosting a Top Chrome WebUI.
+ const char kTopChromeWebUI[] = "top-chrome-webui";
+@@ -759,7 +761,7 @@ const char kUseFakeUIForFedCM[] = "use-fake-ui-for-fedcm";
+ // streams (e.g. WebRTC). Works with --use-fake-device-for-media-stream.
+ // Prefer --auto-accept-camera-and-microphone-capture which does not interact
+ // with screen/tab capture.
+-const char kUseFakeUIForMediaStream[]     = "use-fake-ui-for-media-stream";
++const char kUseFakeUIForMediaStream[] = "use-fake-ui-for-media-stream";
+ 
+ // Texture target for CHROMIUM_image backed video frame textures.
+ const char kVideoImageTextureTarget[] = "video-image-texture-target";
+@@ -777,10 +779,10 @@ const char kUseMockCertVerifierForTesting[] =
+ 
+ // The contents of this flag are prepended to the utility process command line.
+ // Useful values might be "valgrind" or "xterm -e gdb --args".
+-const char kUtilityCmdPrefix[]              = "utility-cmd-prefix";
++const char kUtilityCmdPrefix[] = "utility-cmd-prefix";
+ 
+ // Causes the process to run as a utility subprocess.
+-const char kUtilityProcess[]                = "utility";
++const char kUtilityProcess[] = "utility";
+ 
+ // Causes the utility process to display a dialog on launch.
+ const char kUtilityStartupDialog[] = "utility-startup-dialog";
+@@ -800,7 +802,7 @@ const char kVerifyPixels[] = "browser-ui-tests-verify-pixels";
+ // Will add kWaitForDebugger to every child processes. If a value is passed, it
+ // will be used as a filter to determine if the child process should have the
+ // kWaitForDebugger flag passed on or not.
+-const char kWaitForDebuggerChildren[]       = "wait-for-debugger-children";
++const char kWaitForDebuggerChildren[] = "wait-for-debugger-children";
+ 
+ // On every navigation a message with the renderer's URL will be logged and the
+ // renderer will wait for a debugger to be attached or SIGUSR1 to be sent to
+@@ -846,7 +848,7 @@ const char kWebOtpBackendAuto[] = "web-otp-backend-auto";
+ 
+ // Disables encryption of RTP Media for WebRTC. When Chrome embeds Content, it
+ // ignores this switch on its stable and beta channels.
+-const char kDisableWebRtcEncryption[]      = "disable-webrtc-encryption";
++const char kDisableWebRtcEncryption[] = "disable-webrtc-encryption";
+ 
+ // Override WebRTC IP handling policy to mimic the behavior when WebRTC IP
+ // handling policy is specified in Preferences.
+@@ -885,7 +887,7 @@ const char kWebXrRuntimeOpenXr[] = "openxr";
+ const char kDisableMediaSessionAPI[] = "disable-media-session-api";
+ 
+ // Disable the locking feature of the screen orientation API.
+-const char kDisableScreenOrientationLock[]  = "disable-screen-orientation-lock";
++const char kDisableScreenOrientationLock[] = "disable-screen-orientation-lock";
+ 
+ // Just like kDisableSiteIsolation, but doesn't show the "stability and security
+ // will suffer" butter bar warning.
+@@ -902,14 +904,14 @@ const char kEnableAdaptiveSelectionHandleOrientation[] =
+     "enable-adaptive-selection-handle-orientation";
+ 
+ // Enable drag manipulation of longpress-triggered text selections.
+-const char kEnableLongpressDragSelection[]  = "enable-longpress-drag-selection";
++const char kEnableLongpressDragSelection[] = "enable-longpress-drag-selection";
+ 
+ // Prevent the offline indicator from showing.
+ const char kForceOnlineConnectionStateForIndicator[] =
+     "force-online-connection-state-for-indicator";
+ 
+ // Enables remote debug over HTTP on the specified socket name.
+-const char kRemoteDebuggingSocketName[]     = "remote-debugging-socket-name";
++const char kRemoteDebuggingSocketName[] = "remote-debugging-socket-name";
+ 
+ // Block ChildProcessMain thread of the renderer's ChildProcessService until a
+ // Java debugger is attached.
+@@ -952,7 +954,7 @@ const char kEnableSpeechDispatcher[] = "enable-speech-dispatcher";
+ 
+ #if BUILDFLAG(IS_WIN)
+ // Device scale factor passed to certain processes like renderers, etc.
+-const char kDeviceScaleFactor[]     = "device-scale-factor";
++const char kDeviceScaleFactor[] = "device-scale-factor";
+ 
+ // Disable the Legacy Window which corresponds to the size of the WebContents.
+ const char kDisableLegacyIntermediateWindow[] = "disable-legacy-window";
+diff --git a/content/public/common/content_switches.h b/content/public/common/content_switches.h
+index 7aa438442227c1d07a2abf63d14b36355bec50ff..b94d220ab0cebd546af8c66f4cc86354c6ac7468 100644
+--- a/content/public/common/content_switches.h
++++ b/content/public/common/content_switches.h
+@@ -170,6 +170,7 @@ CONTENT_EXPORT extern const char kPullToRefresh[];
+ CONTENT_EXPORT extern const char kReduceAcceptLanguage[];
+ CONTENT_EXPORT extern const char kReduceAcceptLanguageHTTP[];
+ CONTENT_EXPORT extern const char kReduceUserAgentMinorVersion[];
++CONTENT_EXPORT extern const char kCdpHostProcess[];
+ CONTENT_EXPORT extern const char kRemoteDebuggingPipe[];
+ CONTENT_EXPORT extern const char kRemoteDebuggingPort[];
+ CONTENT_EXPORT extern const char kRemoteAllowOrigins[];

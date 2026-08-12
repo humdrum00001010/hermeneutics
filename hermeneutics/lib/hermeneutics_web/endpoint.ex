@@ -8,7 +8,8 @@ defmodule HermeneuticsWeb.Endpoint do
     store: :cookie,
     key: "_hermeneutics_key",
     signing_salt: "MYqfQVT9",
-    same_site: "Lax"
+    same_site: "None",
+    secure: true
   ]
 
   socket "/live", Phoenix.LiveView.Socket,
