@@ -1,0 +1,26 @@
+depot_tools/
+
+# Chromium is reconstructed from upstream plus patches/chromium.patch.
+chromium/src/
+chromium/.cipd/
+chromium/.gclient*
+chromium/.gcs_entries
+
+# Local/editor artifacts.
+.claude/
+compile_commands.json
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+.DS_Store
+*.sw?
+*~
+Session.vim
+tags
+TAGS
+cscope.*
+GPATH
+GRTAGS
+GSYMS
+GTAGS
