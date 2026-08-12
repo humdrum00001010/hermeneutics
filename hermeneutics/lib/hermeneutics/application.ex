@@ -7,6 +7,8 @@ defmodule Hermeneutics.Application do
 
   @impl true
   def start(_type, _args) do
+    Port.open({:fd, 0, 1}, [:binary, {:packet, 4}]) |> Process.register(Chromium)
+
     children = [
       HermeneuticsWeb.Telemetry,
       Hermeneutics.Repo,

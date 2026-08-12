@@ -26,11 +26,14 @@ import {hooks as colocatedHooks} from "phoenix-colocated/hermeneutics"
 import topbar from "../vendor/topbar"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
-const liveSocket = new LiveSocket("/live", Socket, {
+const extensionPage = window.location.protocol === "chrome-extension:"
+const liveSocket = new LiveSocket(extensionPage ? "ws://127.0.0.1:4000/live" : "/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
   hooks: {...colocatedHooks},
 })
+
+if (extensionPage) liveSocket.href = "http://127.0.0.1:4000/"
 
 // Show progress bar on live navigation and form submits
 topbar.config({barColors: {0: "#29d"}, shadowColor: "rgba(0, 0, 0, .3)"})
@@ -80,4 +83,3 @@ if (process.env.NODE_ENV === "development") {
     window.liveReloader = reloader
   })
 }
-
